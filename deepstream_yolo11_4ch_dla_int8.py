@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-DeepStream 4채널 YOLO11m INT8 추론 파이프라인
+DeepStream 4채널 YOLO11m DLA INT8 추론 파이프라인
 
 추론 흐름:
-  nvinfer (INT8 엔진)
+  nvinfer (DLA core 0 INT8 엔진, GPU fallback)
     → lib_parser_yolo.so NvDsInferParseYolo11  [84,8400] 텐서 파싱
     → DeepStream NMS (cluster-mode=2)
-    → NvDsObjectMeta  (좌표 역변환·obj_label·text_params를 nvinfer가 자동 설정)
+    → NvDsObjectMeta (좌표 역변환·obj_label·text_params를 nvinfer가 자동 설정)
     → nvdsosd         (클래스명 텍스트·바운딩박스 렌더링, probe 불필요)
 
 실행:
-  python3 deepstream_yolo11_4ch_gpu_int8.py [video_path]
-  DISPLAY=:0 python3 deepstream_yolo11_4ch_gpu_int8.py [video_path]
+  python3 deepstream_yolo11_4ch_dla_int8.py [video_path]
+  DISPLAY=:0 python3 deepstream_yolo11_4ch_dla_int8.py [video_path]
 """
 
 import sys
@@ -27,7 +27,7 @@ VIDEO_SOURCE = (
     sys.argv[1] if len(sys.argv) > 1
     else "/opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4"
 )
-PGIE_CONFIG = "/home/nvidia/workspace/deepstream_yolo/config_infer_yolo11_gpu_int8.txt"
+PGIE_CONFIG = "/home/nvidia/workspace/deepstream_yolo/config_infer_yolo11_dla_int8.txt"
 NUM_SOURCES = 4
 MUXER_W     = 1920
 MUXER_H     = 1080
@@ -85,8 +85,8 @@ def main():
     for i in range(NUM_SOURCES):
         make_src_and_connect(i, VIDEO_SOURCE, mux, pipeline)
 
-    # nvinfer: INT8 추론 + C++ 파서 + NMS
-    # labelfile-path → obj_label, text_params(위치·폰트 포함)를 자동 설정
+    # nvinfer: DLA core 0 INT8 추론 + C++ 파서 + NMS
+    # DLA 미지원 레이어(attention 등)는 GPU 자동 폴백
     pgie = Gst.ElementFactory.make("nvinfer", "pgie")
     pgie.set_property("config-file-path", PGIE_CONFIG)
     pipeline.add(pgie)
@@ -94,7 +94,6 @@ def main():
     if USE_DISPLAY:
         tiler    = Gst.ElementFactory.make("nvmultistreamtiler", "tiler")
         conv_osd = Gst.ElementFactory.make("nvvideoconvert",     "conv-osd")
-        # nvdsosd: display-text=1(기본) → text_params.display_text(클래스명) 렌더링
         osd      = Gst.ElementFactory.make("nvdsosd",            "osd")
         conv_out = Gst.ElementFactory.make("nvvideoconvert",     "conv-out")
         sink     = Gst.ElementFactory.make("nv3dsink",           "sink")
@@ -103,8 +102,8 @@ def main():
         tiler.set_property("columns", 2)
         tiler.set_property("width",   MUXER_W)
         tiler.set_property("height",  MUXER_H)
-        osd.set_property("process-mode", 1)   # GPU 렌더링
-        sink.set_property("sync", True)
+        osd.set_property("process-mode", 1)
+        sink.set_property("sync", False)
 
         for el in (tiler, conv_osd, osd, conv_out, sink):
             pipeline.add(el)

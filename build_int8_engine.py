@@ -17,23 +17,31 @@ import cv2
 import tensorrt as trt
 
 # ── 설정 ────────────────────────────────────────────────────────────────────────
-ONNX_PATH     = "yolo11m.onnx"
-ENGINE_PATH   = "yolo11m_b4_int8.engine"
-CALIB_CACHE   = "yolo11m_int8_calib.cache"
-TIMING_CACHE  = "yolo11m_timing.cache"   # 빌더 커널 타이밍 캐시
-VIDEO_PATH    = "video_h264.mp4"
+ONNX_PATH       = "yolo11m.onnx"
+VIDEO_PATH      = "video_h264.mp4"
+CALIB_CACHE     = "yolo11m_int8_calib.cache"
 
-BATCH_SIZE    = 4
-INPUT_H       = 640
-INPUT_W       = 640
+BATCH_SIZE      = 4
+INPUT_H         = 640
+INPUT_W         = 640
 N_CALIB_BATCHES = 25          # 25 배치 × 4 = 100 프레임
-WORKSPACE_GB  = 4
+WORKSPACE_GB    = 4
+
+# ── DLA 설정 ─────────────────────────────────────────────────────────────────
+# -1 = GPU 전용,  0 또는 1 = DLA 코어 번호 (Jetson Orin: 코어 2개)
+DLA_CORE = 0
+
+# DLA_CORE 값에 따라 출력 파일명 자동 결정
+ENGINE_PATH  = (f"yolo11m_b4_dla{DLA_CORE}_int8.engine"
+                if DLA_CORE >= 0 else "yolo11m_b4_int8.engine")
+TIMING_CACHE = (f"yolo11m_dla{DLA_CORE}_timing.cache"
+                if DLA_CORE >= 0 else "yolo11m_timing.cache")
 
 # ── 빌더 성능 옵션 ────────────────────────────────────────────────────────────
 BUILDER_OPT_LEVEL   = 5   # 0~5, 기본=3. 높을수록 빌드 시간↑ 추론 성능↑
 AVG_TIMING_ITERS    = 12  # 커널 선택 시 평균 측정 횟수 (기본=8)
 MIN_TIMING_ITERS    = 2   # 커널 선택 최소 측정 횟수 (기본=1)
-MAX_AUX_STREAMS     = 4   # YOLO 헤드 병렬 분기 실행용 보조 스트림
+MAX_AUX_STREAMS     = 4   # GPU fallback 레이어 병렬 실행용 보조 스트림
 
 # ── CUDA ctypes 래퍼 ─────────────────────────────────────────────────────────
 libcudart = ctypes.CDLL("libcudart.so", use_errno=True)
@@ -149,8 +157,38 @@ class YOLOInt8Calibrator(trt.IInt8EntropyCalibrator2):
         print(f"캘리브레이션 캐시 저장: {self.cache_file}")
 
 
-# ── 엔진 빌드 ────────────────────────────────────────────────────────────────────
-def build_engine(onnx_path, engine_path, calibrator):
+# ── DLA 엔진 빌드 (trtexec) ──────────────────────────────────────────────────────
+# TRT 8.6.2 Python 바인딩은 DLA 엔진 직렬화 시 segfault 버그가 있음.
+# C++ 바이너리인 trtexec는 동일 조건에서 정상 동작하므로 DLA 빌드에 사용.
+def build_engine_dla(onnx_path, engine_path):
+    import subprocess
+    trtexec = "/usr/src/tensorrt/bin/trtexec"
+    cmd = [
+        trtexec,
+        f"--onnx={onnx_path}",
+        f"--saveEngine={engine_path}",
+        "--int8",
+        "--fp16",
+        f"--useDLACore={DLA_CORE}",
+        "--allowGPUFallback",
+        f"--calib={CALIB_CACHE}",
+        "--sparsity=enable",
+        f"--builderOptimizationLevel={BUILDER_OPT_LEVEL}",
+        f"--timingCacheFile={TIMING_CACHE}",
+        f"--memPoolSize=workspace:{WORKSPACE_GB * 1024}MiB",
+        f"--avgTiming={AVG_TIMING_ITERS}",
+    ]
+    print(f"엔진 빌드 중 (DLA core {DLA_CORE} + GPU fallback, INT8+FP16)...")
+    print(f"  명령: {' '.join(cmd)}\n")
+    ret = subprocess.run(cmd, check=False)
+    if ret.returncode != 0:
+        raise RuntimeError(f"trtexec 실패 (exit={ret.returncode})")
+    size_mb = os.path.getsize(engine_path) / 1e6
+    print(f"\n완료: {engine_path} ({size_mb:.1f} MB)")
+
+
+# ── GPU 엔진 빌드 (Python TRT API) ───────────────────────────────────────────────
+def build_engine_gpu(onnx_path, engine_path, calibrator):
     logger  = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(logger)
     network = builder.create_network(
@@ -169,30 +207,17 @@ def build_engine(onnx_path, engine_path, calibrator):
     print(f"  출력: {network.get_output(0).shape}")
 
     config = builder.create_builder_config()
-
-    # ── 메모리 ──────────────────────────────────────────────────────────────────
     config.set_memory_pool_limit(
         trt.MemoryPoolType.WORKSPACE, WORKSPACE_GB * (1 << 30)
     )
-
-    # ── 정밀도 플래그 ────────────────────────────────────────────────────────────
-    config.set_flag(trt.BuilderFlag.FP16)          # INT8 불가 레이어는 FP16 폴백
+    config.set_flag(trt.BuilderFlag.FP16)
     config.set_flag(trt.BuilderFlag.INT8)
-    config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS) # Orin Ampere 2:4 sparse 커널 시도
+    config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
     config.int8_calibrator = calibrator
-
-    # ── 빌더 최적화 레벨 (0~5, 기본=3) ──────────────────────────────────────────
-    # 5로 설정하면 빌드 시간이 늘지만 더 빠른 커널을 선택함
     config.builder_optimization_level = BUILDER_OPT_LEVEL
-
-    # ── 커널 타이밍 정확도 ────────────────────────────────────────────────────────
-    config.avg_timing_iterations = AVG_TIMING_ITERS  # 측정값 평균 횟수
-    config.min_timing_iterations = MIN_TIMING_ITERS  # 최소 측정 횟수
-
-    # ── 보조 스트림 (병렬 분기 실행) ─────────────────────────────────────────────
+    config.avg_timing_iterations = AVG_TIMING_ITERS
+    config.min_timing_iterations = MIN_TIMING_ITERS
     config.max_aux_streams = MAX_AUX_STREAMS
-
-    # ── Tactic 소스: 전체 CUDA 라이브러리에서 최적 커널 탐색 ────────────────────
     config.set_tactic_sources(
         1 << int(trt.TacticSource.CUBLAS) |
         1 << int(trt.TacticSource.CUBLAS_LT) |
@@ -201,7 +226,6 @@ def build_engine(onnx_path, engine_path, calibrator):
         1 << int(trt.TacticSource.JIT_CONVOLUTIONS)
     )
 
-    # ── 타이밍 캐시: 재빌드 시 커널 선택 결과 재사용 ─────────────────────────────
     timing_cache_data = b""
     if os.path.exists(TIMING_CACHE):
         print(f"타이밍 캐시 로드: {TIMING_CACHE}")
@@ -210,7 +234,7 @@ def build_engine(onnx_path, engine_path, calibrator):
     timing_cache = config.create_timing_cache(timing_cache_data)
     config.set_timing_cache(timing_cache, ignore_mismatch=True)
 
-    print(f"엔진 빌드 중 (INT8+FP16, opt_level={BUILDER_OPT_LEVEL}, workspace={WORKSPACE_GB}GB)...")
+    print(f"엔진 빌드 중 (GPU, INT8+FP16, opt_level={BUILDER_OPT_LEVEL}, workspace={WORKSPACE_GB}GB)...")
     print("  처음 빌드 시 수십 분이 소요됩니다.")
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
@@ -219,7 +243,6 @@ def build_engine(onnx_path, engine_path, calibrator):
     with open(engine_path, "wb") as f:
         f.write(serialized)
 
-    # ── 타이밍 캐시 저장 ─────────────────────────────────────────────────────────
     with timing_cache.serialize() as buf:
         with open(TIMING_CACHE, "wb") as f:
             f.write(bytes(buf))
@@ -232,7 +255,8 @@ def build_engine(onnx_path, engine_path, calibrator):
 # ── 메인 ────────────────────────────────────────────────────────────────────────
 def main():
     n_total = N_CALIB_BATCHES * BATCH_SIZE
-    print(f"=== YOLO11m INT8 엔진 빌드 ===")
+    mode = f"DLA core {DLA_CORE} + GPU fallback" if DLA_CORE >= 0 else "GPU"
+    print(f"=== YOLO11m INT8 엔진 빌드 ({mode}) ===")
     print(f"ONNX   : {ONNX_PATH}")
     print(f"Engine : {ENGINE_PATH}")
     print(f"캘리브레이션: {n_total}프레임 ({N_CALIB_BATCHES}배치 × {BATCH_SIZE})")
@@ -243,11 +267,19 @@ def main():
     if len(frames) < BATCH_SIZE:
         raise RuntimeError("캘리브레이션 프레임이 부족합니다.")
 
-    print(f"\n[2/3] 캘리브레이터 준비")
-    calibrator = YOLOInt8Calibrator(frames, BATCH_SIZE, CALIB_CACHE)
-
     print(f"\n[3/3] TensorRT 엔진 빌드")
-    build_engine(ONNX_PATH, ENGINE_PATH, calibrator)
+    if DLA_CORE >= 0:
+        # DLA: trtexec 사용 (Python 바인딩 segfault 우회)
+        # 캘리브레이션 캐시가 없으면 먼저 GPU 빌드로 생성 필요
+        if not os.path.exists(CALIB_CACHE):
+            print(f"  캘리브레이션 캐시 없음 → GPU 빌드로 먼저 생성하세요 (DLA_CORE=-1)")
+            raise RuntimeError(f"캘리브레이션 캐시 필요: {CALIB_CACHE}")
+        build_engine_dla(ONNX_PATH, ENGINE_PATH)
+    else:
+        print(f"\n[2/3] 캘리브레이터 준비")
+        calibrator = YOLOInt8Calibrator(frames, BATCH_SIZE, CALIB_CACHE)
+        build_engine_gpu(ONNX_PATH, ENGINE_PATH, calibrator)
+
     print(f"\n캘리브레이션 캐시: {CALIB_CACHE}")
     print(f"타이밍 캐시     : {TIMING_CACHE} (재빌드 시 커널 선택 재사용)")
 
