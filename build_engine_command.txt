@@ -1,9 +1,0 @@
-/usr/src/tensorrt/bin/trtexec \
-  --onnx=yolo11m.onnx \
-  --saveEngine=yolo11m.onnx_b4_gpu_fp16.engine \
-  --fp16 \
-  --useCudaGraph \
-  --timingCacheFile=yolo11_timing.cache \
-  --avgTiming=100 \
-  --sparsity=enable \
-  --memPoolSize=workspace:8192MiB

@@ -1,0 +1,47 @@
+################################################################################
+# config_infer_yolo11_gpu_int8.txt
+# YOLO11m INT8 엔진, batch=4
+# C++ 커스텀 파서(lib_parser_yolo.so)로 [84,8400] 텐서 파싱 후 DeepStream NMS
+################################################################################
+
+[property]
+gpu-id=0
+
+# 입력 전처리: 1/255 정규화, RGB
+net-scale-factor=0.00392156862745098
+model-color-format=0
+
+# INT8 엔진 경로 (build_int8_engine.py 로 빌드한 파일)
+model-engine-file=/home/nvidia/workspace/deepstream_yolo/yolo11m_b4_int8.engine
+
+# 0=FP32  1=INT8  2=FP16
+network-mode=1
+
+# 입력 크기 (C;H;W)
+infer-dims=3;640;640
+batch-size=4
+
+# Letterbox 종횡비 유지 + 중앙 패딩 (YOLO 학습 기준과 일치)
+maintain-aspect-ratio=1
+symmetric-padding=1
+
+# network-type=0: 표준 검출기 → C++ 파서가 NvDsInferParseObjectInfo 반환
+network-type=0
+num-detected-classes=80
+
+# C++ 커스텀 파서: [84,8400] 텐서 → (cx,cy,w,h,class) 변환
+custom-lib-path=/home/nvidia/workspace/deepstream_yolo/lib_parser_yolo.so
+parse-bbox-func-name=NvDsInferParseYolo11
+
+# cluster-mode=2: NMS (파서 출력 후 DeepStream이 NMS 적용)
+cluster-mode=2
+nms-iou-threshold=0.45
+
+labelfile-path=/home/nvidia/workspace/deepstream_yolo/coco_labels.txt
+
+process-mode=1
+interval=0
+gie-unique-id=1
+
+[class-attrs-all]
+pre-cluster-threshold=0.30
