@@ -1,0 +1,62 @@
+# config_infer_yolo11_dla0_int8.txt
+# ============================================================
+# nvinfer 설정 — DLA Core 0 (채널 0, 1 담당)
+# ============================================================
+# [핵심 포인트]
+#   batch-size = 2        : 채널 2개를 한 배치로 처리
+#   use-dla-core = 0      : DLA Core 0 사용
+#   engine-file           : DLA Core 0 전용 INT8 엔진
+#   network-type = 0      : Detector (YOLO)
+# ============================================================
+
+[property]
+
+# ── 기본 설정 ────────────────────────────────────────────────
+gpu-id=0
+net-scale-factor=0.00392156862745098
+
+# ── 모델 파일 ────────────────────────────────────────────────
+onnx-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_512_split.onnx
+model-engine-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_512_b2_dla0_int8.engine
+model-color-format=0
+
+# ── 입력 해상도 ──────────────────────────────────────────────
+infer-dims=3;512;512
+
+# ── 배치 설정 ────────────────────────────────────────────────
+# 이 nvinfer는 채널 2개(0, 1)를 담당 → batch-size=2
+batch-size=2
+
+# ── 정밀도 및 DLA 설정 ───────────────────────────────────────
+# [비유] 이 라인은 DLA Core 0 전용 생산 설비를 사용하고
+#        INT8+FP16 정밀도로 고속 추론합니다
+network-mode=1
+use-dla-core=0
+enable-dla=1
+
+# ── 커스텀 파서 (YOLO11 전용) ─────────────────────────────────
+# marcoslucianops/DeepStream-Yolo 라이브러리
+custom-lib-path=/home/nvidia/workspace/deepstream_yolo/lib_parser_yolo.so
+parse-bbox-func-name=NvDsInferParseYolov8
+
+# ── 네트워크 타입 및 클래스 ──────────────────────────────────
+network-type=0
+num-detected-classes=80
+
+# ── NMS 설정 (cluster-mode=2: DBSCAN 기반 NMS) ───────────────
+cluster-mode=2
+
+# ── 레이블 파일 ──────────────────────────────────────────────
+labelfile-path=/home/nvidia/workspace/deepstream_yolo/coco_labels.txt
+
+# ── 출력 설정 ────────────────────────────────────────────────
+output-blob-names=output_boxes;output_classes
+maintain-aspect-ratio=1
+symmetric-padding=1
+process-mode=1
+interval=0
+gie-unique-id=1
+
+[class-attrs-all]
+nms-iou-threshold=0.45
+pre-cluster-threshold=0.25
