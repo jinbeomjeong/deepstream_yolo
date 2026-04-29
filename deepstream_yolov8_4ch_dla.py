@@ -33,6 +33,17 @@ import time
 import logging
 import argparse
 import gi
+try:
+    import nvtx
+    _NVTX = True
+except ImportError:
+    import contextlib
+    class _NvtxStub:
+        @staticmethod
+        def annotate(msg="", color=None, **kw):
+            return contextlib.nullcontext()
+    nvtx = _NvtxStub()
+    _NVTX = False
 
 gi.require_version("Gst", "1.0")
 from gi.repository import GObject, Gst, GLib
@@ -210,7 +221,8 @@ def build_pipeline(video_source: str, use_display: bool) -> tuple:
     3. 두 nvinfer 출력을 funnel로 합류
     4. 후처리(tiler, osd) → sink
     """
-    Gst.init(None)
+    with nvtx.annotate("pipeline_init", color="green"):
+        Gst.init(None)
     pipeline = Gst.Pipeline()
     loop     = GLib.MainLoop()
 
@@ -218,32 +230,34 @@ def build_pipeline(video_source: str, use_display: bool) -> tuple:
     nvinfer_outputs = []   # funnel 연결을 위해 nvinfer 엘리먼트 보관
 
     # ── 1. DLA 코어별 (mux → nvinfer) 쌍 구성 ────────────────────────────
-    for dla_core, channels in DLA_GROUPS.items():
-        logger.info("DLA Core %d 구성 — 채널 %s", dla_core, channels)
+    with nvtx.annotate("build_dla_pairs", color="blue"):
+        for dla_core, channels in DLA_GROUPS.items():
+            logger.info("DLA Core %d 구성 — 채널 %s", dla_core, channels)
 
-        # nvstreammux_dlaX
-        mux = make_element("nvstreammux", f"mux-dla{dla_core}")
-        mux.set_property("width",                MUXER_W)
-        mux.set_property("height",               MUXER_H)
-        mux.set_property("batch-size",           DLA_BATCH)
-        mux.set_property("batched-push-timeout", 40_000)   # μs
-        pipeline.add(mux)
+            # nvstreammux_dlaX
+            mux = make_element("nvstreammux", f"mux-dla{dla_core}")
+            mux.set_property("width",                MUXER_W)
+            mux.set_property("height",               MUXER_H)
+            mux.set_property("batch-size",           DLA_BATCH)
+            mux.set_property("batched-push-timeout", 40_000)   # μs
+            mux.set_property("nvbuf-memory-type",    4)        # NVBUF_MEM_SURFACE_ARRAY: Jetson 유일 지원 타입
+            pipeline.add(mux)
 
-        # 채널 소스 직결
-        for ch_idx in channels:
-            add_source_to_mux(pipeline, ch_idx, video_source, mux, ch_idx)
+            # 채널 소스 직결
+            for ch_idx in channels:
+                add_source_to_mux(pipeline, ch_idx, video_source, mux, ch_idx)
 
-        # nvinfer_dlaX
-        pgie = make_element("nvinfer", f"pgie-dla{dla_core}")
-        pgie.set_property("config-file-path", pgie_configs[dla_core])
-        pipeline.add(pgie)
+            # nvinfer_dlaX
+            pgie = make_element("nvinfer", f"pgie-dla{dla_core}")
+            pgie.set_property("config-file-path", pgie_configs[dla_core])
+            pipeline.add(pgie)
 
-        if not mux.link(pgie):
-            raise RuntimeError(f"mux-dla{dla_core} → pgie-dla{dla_core} 링크 실패")
+            if not mux.link(pgie):
+                raise RuntimeError(f"mux-dla{dla_core} → pgie-dla{dla_core} 링크 실패")
 
-        nvinfer_outputs.append(pgie)
-        logger.info("mux-dla%d → pgie-dla%d 연결 완료 (설정: %s)",
-                    dla_core, dla_core, pgie_configs[dla_core])
+            nvinfer_outputs.append(pgie)
+            logger.info("mux-dla%d → pgie-dla%d 연결 완료 (설정: %s)",
+                        dla_core, dla_core, pgie_configs[dla_core])
 
     # ── 2. funnel (두 nvinfer 출력 합류) ───────────────────────────────
     funnel = make_element("funnel", "funnel")
@@ -300,40 +314,44 @@ def attach_inference_probe(pipeline: Gst.Pipeline) -> None:
     각 nvinfer 출력 패드에 probe를 부착하여 탐지 결과를 콘솔에 출력.
     성능 측정이나 디버깅 시 활용. 불필요 시 main()에서 호출 제거.
     """
+    _PROBE_COLORS = {0: "yellow", 1: "cyan"}
+
     def make_probe(dla_core: int):
+        _color = _PROBE_COLORS.get(dla_core, "white")
         def probe_cb(pad, info):
             buf = info.get_buffer()
             if not buf:
                 return Gst.PadProbeReturn.OK
 
-            batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
-            if not batch_meta:
-                return Gst.PadProbeReturn.OK
+            with nvtx.annotate(f"infer_probe_dla{dla_core}", color=_color):
+                batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
+                if not batch_meta:
+                    return Gst.PadProbeReturn.OK
 
-            frame_list = batch_meta.frame_meta_list
-            while frame_list:
-                try:
-                    frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
-                except StopIteration:
-                    break
-
-                n_objs = 0
-                obj_list = frame_meta.obj_meta_list
-                while obj_list:
+                frame_list = batch_meta.frame_meta_list
+                while frame_list:
                     try:
-                        pyds.NvDsObjectMeta.cast(obj_list.data)
-                        n_objs += 1
-                        obj_list = obj_list.next
+                        frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
                     except StopIteration:
                         break
 
-                logger.info("DLA%d ch=%d frame=%d objs=%d",
-                            dla_core, frame_meta.source_id,
-                            frame_meta.frame_num, n_objs)
-                try:
-                    frame_list = frame_list.next
-                except StopIteration:
-                    break
+                    n_objs = 0
+                    obj_list = frame_meta.obj_meta_list
+                    while obj_list:
+                        try:
+                            pyds.NvDsObjectMeta.cast(obj_list.data)
+                            n_objs += 1
+                            obj_list = obj_list.next
+                        except StopIteration:
+                            break
+
+                    logger.info("DLA%d ch=%d frame=%d objs=%d",
+                                dla_core, frame_meta.source_id,
+                                frame_meta.frame_num, n_objs)
+                    try:
+                        frame_list = frame_list.next
+                    except StopIteration:
+                        break
 
             return Gst.PadProbeReturn.OK
         return probe_cb
@@ -352,35 +370,40 @@ def attach_inference_probe(pipeline: Gst.Pipeline) -> None:
 def attach_fps_probe(pipeline: Gst.Pipeline) -> None:
     """각 nvinfer src pad에 probe를 부착하여 채널별 FPS를 주기적으로 출력."""
 
+    _FPS_COLORS = {0: "yellow", 1: "cyan"}
+
     def make_probe(dla_core: int):
+        _color = _FPS_COLORS.get(dla_core, "white")
         def probe_cb(pad, info):
             buf = info.get_buffer()
             if not buf:
                 return Gst.PadProbeReturn.OK
-            batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
-            if not batch_meta:
-                return Gst.PadProbeReturn.OK
 
-            updated = False
-            frame_list = batch_meta.frame_meta_list
-            while frame_list:
-                try:
-                    frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
-                except StopIteration:
-                    break
-                if _fps_counter.tick(frame_meta.source_id):
-                    updated = True
-                try:
-                    frame_list = frame_list.next
-                except StopIteration:
-                    break
+            with nvtx.annotate(f"fps_probe_dla{dla_core}", color=_color):
+                batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buf))
+                if not batch_meta:
+                    return Gst.PadProbeReturn.OK
 
-            if updated:
-                fps = _fps_counter.all()
-                logger.info(
-                    "FPS | ch0=%5.1f  ch1=%5.1f  ch2=%5.1f  ch3=%5.1f",
-                    fps[0], fps[1], fps[2], fps[3],
-                )
+                updated = False
+                frame_list = batch_meta.frame_meta_list
+                while frame_list:
+                    try:
+                        frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
+                    except StopIteration:
+                        break
+                    if _fps_counter.tick(frame_meta.source_id):
+                        updated = True
+                    try:
+                        frame_list = frame_list.next
+                    except StopIteration:
+                        break
+
+                if updated:
+                    fps = _fps_counter.all()
+                    logger.info(
+                        "FPS | ch0=%5.1f  ch1=%5.1f  ch2=%5.1f  ch3=%5.1f",
+                        fps[0], fps[1], fps[2], fps[3],
+                    )
             return Gst.PadProbeReturn.OK
         return probe_cb
 
@@ -407,7 +430,8 @@ def main():
         logger.info("DLA Core %d : 채널 %s", core, channels)
     logger.info("디스플레이 : %s", "활성 (nv3dsink)" if args.display else "비활성 (fakesink)")
 
-    pipeline, loop = build_pipeline(args.video, args.display)
+    with nvtx.annotate("build_pipeline", color="green"):
+        pipeline, loop = build_pipeline(args.video, args.display)
     attach_fps_probe(pipeline)
 
     bus = pipeline.get_bus()
@@ -415,14 +439,16 @@ def main():
     bus.connect("message", bus_call, loop)
 
     logger.info("파이프라인 시작...")
-    ret = pipeline.set_state(Gst.State.PLAYING)
+    with nvtx.annotate("pipeline_state_playing", color="orange"):
+        ret = pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
         logger.error("파이프라인 PLAYING 전환 실패")
         pipeline.set_state(Gst.State.NULL)
         sys.exit(1)
 
     try:
-        loop.run()
+        with nvtx.annotate("pipeline_running", color="purple"):
+            loop.run()
     except KeyboardInterrupt:
         logger.info("사용자 중단 (Ctrl+C)")
     finally:

@@ -56,7 +56,6 @@ symmetric-padding=1
 process-mode=1
 interval=0
 gie-unique-id=2
-
 [class-attrs-all]
 nms-iou-threshold=0.45
 pre-cluster-threshold=0.25
