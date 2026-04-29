@@ -1,4 +1,4 @@
-# config_infer_yolo11_dla0_int8.txt
+# config_infer_yolov8_dla0_int8.txt
 # ============================================================
 # nvinfer 설정 — DLA Core 0 (채널 0, 1 담당)
 # ============================================================
@@ -34,7 +34,7 @@ network-mode=1
 use-dla-core=0
 enable-dla=1
 
-# ── 커스텀 파서 (YOLO11 전용) ─────────────────────────────────
+# ── 커스텀 파서 (YOLOv8 전용) ─────────────────────────────────
 # marcoslucianops/DeepStream-Yolo 라이브러리
 custom-lib-path=/home/nvidia/workspace/deepstream_yolo/lib_parser_yolo.so
 parse-bbox-func-name=NvDsInferParseYolov8

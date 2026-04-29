@@ -1,4 +1,4 @@
-g++ -o lib_parser_yolo.so parser_yolo11.cpp \
+g++ -o lib_parser_yolo.so parser_yolov8.cpp \
 -Wall -std=c++11 -shared -fPIC \
 -I /opt/nvidia/deepstream/deepstream/sources/includes \
 -I /usr/local/cuda/include

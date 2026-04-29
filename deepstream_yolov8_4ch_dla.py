@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-deepstream_yolo11_4ch_2dla_optimized.py
-========================================
+deepstream_yolov8_4ch_dla.py
+============================
 4채널 영상을 처음부터 2채널씩 분리하여 각 DLA 코어에 직접 연결하는
 최적화된 DeepStream 파이프라인
 
@@ -23,14 +23,15 @@ deepstream_yolo11_4ch_2dla_optimized.py
   → GPU/CPU 메모리 복사 1회 감소, 동기화 오버헤드 제거
 
 [실행]
-  python3 deepstream_yolo11_4ch_2dla_optimized.py [video_path]
-  DISPLAY=:0 python3 deepstream_yolo11_4ch_2dla_optimized.py [video_path]
+  python3 deepstream_yolov8_4ch_dla.py [video_path]
+  python3 deepstream_yolov8_4ch_dla.py video.mp4 --display
 """
 
 import sys
 import os
 import time
 import logging
+import argparse
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -52,18 +53,12 @@ logger = logging.getLogger("deepstream_yolo")
 # ══════════════════════════════════════════════════════════════════════════════
 # 설정
 # ══════════════════════════════════════════════════════════════════════════════
-VIDEO_SOURCE = (
-    sys.argv[1] if len(sys.argv) > 1
-    else "/opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4"
-)
-
 PGIE_CONFIG_DLA0 = "/home/nvidia/workspace/deepstream_yolo/config_infer_yolov8_dla0_int8.txt"
 PGIE_CONFIG_DLA1 = "/home/nvidia/workspace/deepstream_yolo/config_infer_yolov8_dla1_int8.txt"
 
-MUXER_W     = 1920
-MUXER_H     = 1080
-DLA_BATCH   = 2          # DLA 코어 1개당 채널 수
-USE_DISPLAY = bool(os.environ.get("DISPLAY"))
+MUXER_W   = 1920
+MUXER_H   = 1080
+DLA_BATCH = 2          # DLA 코어 1개당 채널 수
 
 # DLA 코어별 담당 채널 정의
 # [비유] 처음부터 "채널 0,1은 계산대 A, 채널 2,3은 계산대 B"로 배정
@@ -73,6 +68,23 @@ DLA_GROUPS = {
 }
 
 FPS_REPORT_INTERVAL = 2.0   # 초 단위 FPS 출력 주기
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 인자 파싱
+# ══════════════════════════════════════════════════════════════════════════════
+def parse_args():
+    parser = argparse.ArgumentParser(description="DeepStream 4채널 YOLOv8m 2×DLA 파이프라인")
+    parser.add_argument(
+        "video", nargs="?",
+        default="/opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4",
+        help="입력 영상 경로 (기본값: DeepStream 샘플 영상)",
+    )
+    parser.add_argument(
+        "--display", action="store_true", default=bool(os.environ.get("DISPLAY")),
+        help="화면 출력 활성화 (기본: DISPLAY 환경변수 자동 감지)",
+    )
+    return parser.parse_args()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -188,7 +200,7 @@ def add_source_to_mux(pipeline: Gst.Pipeline,
 # ══════════════════════════════════════════════════════════════════════════════
 # 파이프라인 구성
 # ══════════════════════════════════════════════════════════════════════════════
-def build_pipeline() -> tuple:
+def build_pipeline(video_source: str, use_display: bool) -> tuple:
     """
     최적화된 파이프라인 조립.
 
@@ -219,7 +231,7 @@ def build_pipeline() -> tuple:
 
         # 채널 소스 직결
         for ch_idx in channels:
-            add_source_to_mux(pipeline, ch_idx, VIDEO_SOURCE, mux, ch_idx)
+            add_source_to_mux(pipeline, ch_idx, video_source, mux, ch_idx)
 
         # nvinfer_dlaX
         pgie = make_element("nvinfer", f"pgie-dla{dla_core}")
@@ -243,7 +255,7 @@ def build_pipeline() -> tuple:
         logger.info("%s → funnel 연결 완료", pgie.get_name())
 
     # ── 3. 후처리 + 출력 ─────────────────────────────────────────────────
-    if USE_DISPLAY:
+    if use_display:
         tiler    = make_element("nvmultistreamtiler", "tiler")
         conv_osd = make_element("nvvideoconvert",     "conv-osd")
         osd      = make_element("nvdsosd",            "osd")
@@ -385,15 +397,17 @@ def attach_fps_probe(pipeline: Gst.Pipeline) -> None:
 # 메인
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
+    args = parse_args()
+
     logger.info("=" * 60)
-    logger.info("DeepStream 4채널 YOLO11m — 2× DLA 직결 파이프라인")
+    logger.info("DeepStream 4채널 YOLOv8m — 2× DLA 직결 파이프라인")
     logger.info("=" * 60)
-    logger.info("영상 소스  : %s", VIDEO_SOURCE)
+    logger.info("영상 소스  : %s", args.video)
     for core, channels in DLA_GROUPS.items():
         logger.info("DLA Core %d : 채널 %s", core, channels)
-    logger.info("디스플레이 : %s", "활성 (nv3dsink)" if USE_DISPLAY else "비활성 (fakesink)")
+    logger.info("디스플레이 : %s", "활성 (nv3dsink)" if args.display else "비활성 (fakesink)")
 
-    pipeline, loop = build_pipeline()
+    pipeline, loop = build_pipeline(args.video, args.display)
     attach_fps_probe(pipeline)
 
     bus = pipeline.get_bus()

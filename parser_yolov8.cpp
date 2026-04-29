@@ -1,4 +1,4 @@
-// parser_yolo11.cpp
+// parser_yolov8.cpp
 // YOLO 탐지 결과 파서 — split 출력 (output_boxes / output_classes) 지원
 //
 // 입력 텐서:
