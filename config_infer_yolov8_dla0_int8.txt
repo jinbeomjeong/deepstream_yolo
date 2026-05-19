@@ -16,12 +16,12 @@ gpu-id=0
 net-scale-factor=0.00392156862745098
 
 # ── 모델 파일 ────────────────────────────────────────────────
-onnx-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_512_split.onnx
-model-engine-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_512_b2_dla0_int8.engine
+onnx-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_split.onnx
+model-engine-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_b2_dla0_int8.engine
 model-color-format=0
 
 # ── 입력 해상도 ──────────────────────────────────────────────
-infer-dims=3;512;512
+infer-dims=3;640;640
 
 # ── 배치 설정 ────────────────────────────────────────────────
 # 이 nvinfer는 채널 2개(0, 1)를 담당 → batch-size=2

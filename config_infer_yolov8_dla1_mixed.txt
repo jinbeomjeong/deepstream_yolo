@@ -1,12 +1,13 @@
-# config_infer_yolov8_dla1_int8.txt
+# config_infer_yolov8_dla1_mixed.txt
 # ============================================================
-# nvinfer 설정 — DLA Core 1 (채널 2, 3 담당)
-# ============================================================
-# [핵심 포인트]
-#   batch-size = 2        : 채널 2개를 한 배치로 처리
-#   use-dla-core = 1      : DLA Core 1 사용 (DLA0과 독립 병렬 실행)
-#   engine-file           : DLA Core 1 전용 INT8 엔진
-#   network-type = 0      : Detector (YOLO)
+# nvinfer 설정 — DLA Core 1, Mixed Precision
+#
+# [전략]
+#   Backbone/Neck → DLA Core 1  INT8   (속도)
+#   Detection Head → GPU        FP16   (bbox/cls 정밀도)
+#
+# [엔진 빌드]
+#   python3 build_mixed_engine.py --dla-core 1
 # ============================================================
 
 [property]
@@ -17,25 +18,22 @@ net-scale-factor=0.00392156862745098
 
 # ── 모델 파일 ────────────────────────────────────────────────
 onnx-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_split.onnx
-model-engine-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_b2_dla1_int8.engine
+model-engine-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_b2_dla1_mixed.engine
 model-color-format=0
 
 # ── 입력 해상도 ──────────────────────────────────────────────
 infer-dims=3;640;640
 
 # ── 배치 설정 ────────────────────────────────────────────────
-# 이 nvinfer는 채널 2개(2, 3)를 담당 → batch-size=2
 batch-size=2
 
 # ── 정밀도 및 DLA 설정 ───────────────────────────────────────
-# [비유] 이 라인은 DLA Core 1 전용 생산 설비를 사용하고
-#        DLA Core 0과 완전히 독립적으로 병렬 동작합니다
+# network-mode=1: INT8+FP16 혼합 (엔진 내부에서 레이어별 분리)
 network-mode=1
 use-dla-core=1
 enable-dla=1
 
 # ── 커스텀 파서 (YOLOv8 전용) ─────────────────────────────────
-# marcoslucianops/DeepStream-Yolo 라이브러리
 custom-lib-path=/home/nvidia/workspace/deepstream_yolo/lib_parser_yolo.so
 parse-bbox-func-name=NvDsInferParseYolov8
 
@@ -56,6 +54,7 @@ symmetric-padding=1
 process-mode=1
 interval=0
 gie-unique-id=2
+
 [class-attrs-all]
 nms-iou-threshold=0.45
 pre-cluster-threshold=0.25

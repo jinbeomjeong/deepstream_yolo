@@ -64,8 +64,8 @@ logger = logging.getLogger("deepstream_yolo")
 # ══════════════════════════════════════════════════════════════════════════════
 # 설정
 # ══════════════════════════════════════════════════════════════════════════════
-PGIE_CONFIG_DLA0 = "/home/nvidia/workspace/deepstream_yolo/config_infer_yolov8_dla0_int8.txt"
-PGIE_CONFIG_DLA1 = "/home/nvidia/workspace/deepstream_yolo/config_infer_yolov8_dla1_int8.txt"
+PGIE_CONFIG_DLA0 = "/home/nvidia/workspace/deepstream_yolo/config_infer_yolov8_dla0_mixed.txt"
+PGIE_CONFIG_DLA1 = "/home/nvidia/workspace/deepstream_yolo/config_infer_yolov8_dla1_mixed.txt"
 
 MUXER_W   = 1920
 MUXER_H   = 1080
