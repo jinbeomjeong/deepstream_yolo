@@ -11,8 +11,8 @@ YOLOv8m INT8 캘리브레이션 캐시 생성 및 DLA 엔진 빌드
   DLA_CORE=1 python3 build_int8_engine.py   → yolov8m_512_b2_dla1_int8.engine
 
 [캘리브레이션 전략]
-  캘리브레이션 전용 ONNX (batch=CALIB_BATCH_SIZE=100) 로 빠르게 calib cache 생성.
-  TRT get_batch 호출 수 = 2000 / 100 = 20회/pass  (batch=2 대비 50배 감소)
+  캘리브레이션 전용 ONNX ({model}_{input_size}_b{N}_calib_split.onnx) 로 calib cache 생성.
+  배치 크기 N 은 파일명에서 자동 파싱 → CALIB_BATCH_SIZE 상수 불필요.
 
   왜 MinMaxCalibrator 인가:
     IInt8EntropyCalibrator2 는 희소한 고신뢰도 앵커를 KL 최적화로 클리핑해
@@ -21,6 +21,7 @@ YOLOv8m INT8 캘리브레이션 캐시 생성 및 DLA 엔진 빌드
 """
 
 import os
+import re
 import glob
 import argparse
 import numpy as np
@@ -31,9 +32,8 @@ import pycuda.autoinit   # CUDA 컨텍스트 자동 초기화
 
 # ── 고정 상수 (argparse 인자와 무관) ─────────────────────────────────────────
 BATCH_SIZE        = 2      # 엔진 배치 크기 (DLA 요건)
-CALIB_BATCH_SIZE  = 100    # 캘리브레이션 배치 크기 (클수록 빠름)
-MAX_CALIB_IMAGES  = 2000
-CALIB_IMG_DIR     = "/home/nvidia/workspace/train2017"
+MAX_CALIB_IMAGES  = 5000
+CALIB_IMG_DIR     = "/home/nvidia/workspace/val2017"
 WORKSPACE_GB      = 4
 BUILDER_OPT_LEVEL = 5
 AVG_TIMING_ITERS  = 12
@@ -54,12 +54,33 @@ def parse_args():
     )
     parser.add_argument("--model", default="yolov8m",
                         help="모델 이름 (기본값: yolov8m)")
-    parser.add_argument("--input-size", type=int, default=512, metavar="N",
-                        help="입력 해상도 (기본값: 512)")
+    parser.add_argument("--input-size", type=int, default=640, metavar="N",
+                        help="입력 해상도 (기본값: 640)")
     parser.add_argument("--dla-core", type=int, default=-1, choices=[-1, 0, 1],
                         help="-1: 캘리브레이션 캐시 생성만, 0/1: DLA 엔진 빌드 (기본값: -1)")
     return parser.parse_args()
 
+
+
+# ── 캘리브레이션 ONNX 자동 탐색 ──────────────────────────────────────────────────
+def find_calib_onnx(model, input_size):
+    pattern = f"{model}_{input_size}_b*_calib_split.onnx"
+    matches = glob.glob(pattern)
+    if not matches:
+        raise RuntimeError(
+            f"캘리브레이션 ONNX 없음 (패턴: {pattern})\n"
+            "먼저 export_yolov8.py 를 실행하세요"
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"캘리브레이션 ONNX 파일이 여러 개 발견됨: {matches}\n"
+            "파일을 정리하거나 하나만 남겨 주세요"
+        )
+    path = matches[0]
+    m = re.search(r"_b(\d+)_calib_split\.onnx$", path)
+    if not m:
+        raise RuntimeError(f"파일명에서 배치 크기를 파싱할 수 없음: {path}")
+    return path, int(m.group(1))
 
 
 # ── 전처리 ──────────────────────────────────────────────────────────────────────
@@ -153,7 +174,7 @@ def patch_calib_cache_for_trtexec(cache_file):
 
 # ── 캘리브레이션 캐시 생성 ─────────────────────────────────────────────────────
 # CALIB_ONNX (batch=CALIB_BATCH_SIZE) 로 INT8 캘리브레이션 실행 → cache 저장, 엔진 버림
-def generate_calib_cache(image_paths, calib_onnx_path, calib_cache, input_size):
+def generate_calib_cache(image_paths, calib_onnx_path, calib_cache, input_size, calib_batch_size):
     logger  = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
     network = builder.create_network(
@@ -175,12 +196,12 @@ def generate_calib_cache(image_paths, calib_onnx_path, calib_cache, input_size):
     # 캘리브레이션 후 버릴 엔진이므로 최적화 수준을 최소로 설정
     # (캘리브레이션 캐시 품질은 최적화 수준과 무관)
     config.builder_optimization_level = 0
-    calibrator = YOLOInt8Calibrator(image_paths, CALIB_BATCH_SIZE, calib_cache,
+    calibrator = YOLOInt8Calibrator(image_paths, calib_batch_size, calib_cache,
                                     input_size, input_size)
     config.int8_calibrator = calibrator
 
-    n_batches = len(image_paths) // CALIB_BATCH_SIZE
-    print(f"  {len(image_paths)}장 / {CALIB_BATCH_SIZE}장/배치 = {n_batches}배치")
+    n_batches = len(image_paths) // calib_batch_size
+    print(f"  {len(image_paths)}장 / {calib_batch_size}장/배치 = {n_batches}배치")
     print("  캘리브레이션 실행 중... (캐시 저장 후 버릴 엔진은 최소 빌드)")
     builder.build_serialized_network(network, config)
     print(f"  캘리브레이션 완료 → {calib_cache}")
@@ -221,9 +242,10 @@ def main():
     input_size = args.input_size
     dla_core   = args.dla_core
 
+    calib_onnx, calib_batch_size = find_calib_onnx(model, input_size)
+
     onnx_path      = f"{model}_{input_size}_split.onnx"
     calib_cache    = f"{model}_{input_size}_int8_calib.cache"
-    calib_onnx     = f"{model}_{input_size}_b{CALIB_BATCH_SIZE}_calib_split.onnx"
     engine_path    = f"{model}_{input_size}_b{BATCH_SIZE}_dla{dla_core}_int8.engine"
     timing_cache   = f"{model}_{input_size}_dla{dla_core}_timing.cache"
 
@@ -243,7 +265,7 @@ def main():
     else:
         # ── 캘리브레이션 캐시 생성 (엔진 파일 생성 없음) ────────────────────────
         print(f"=== YOLOv8m INT8 캘리브레이션 캐시 생성 ===")
-        print(f"캘리브 ONNX : {calib_onnx}  (batch={CALIB_BATCH_SIZE})")
+        print(f"캘리브 ONNX : {calib_onnx}  (batch={calib_batch_size})")
         print(f"캘리브 이미지: {CALIB_IMG_DIR}  최대 {MAX_CALIB_IMAGES}장")
         print(f"출력 캐시   : {calib_cache}")
         print()
@@ -257,18 +279,13 @@ def main():
         np.random.shuffle(all_files)
         all_files = all_files[:MAX_CALIB_IMAGES]
         print(f"[1/2] 캘리브레이션 이미지: {len(all_files)}장 선택\n")
-
-        # 캘리브레이션 ONNX 확인
-        if not os.path.exists(calib_onnx):
-            raise RuntimeError(
-                f"캘리브레이션 ONNX 없음 → 먼저 export_yolov8.py 를 실행하세요: {calib_onnx}")
         print(f"[2/2] 캘리브레이션 ONNX: {calib_onnx}\n")
 
         # 캘리브레이션 캐시 생성
         if os.path.exists(calib_cache):
             print(f"캘리브레이션 캐시 이미 존재, 재사용: {calib_cache}")
         else:
-            generate_calib_cache(all_files, calib_onnx, calib_cache, input_size)
+            generate_calib_cache(all_files, calib_onnx, calib_cache, input_size, calib_batch_size)
 
         print(f"\n완료: {calib_cache}")
         print("다음 단계:")

@@ -92,8 +92,8 @@ def parse_args():
         help="입력 영상 경로 (기본값: DeepStream 샘플 영상)",
     )
     parser.add_argument(
-        "--display", action="store_true", default=bool(os.environ.get("DISPLAY")),
-        help="화면 출력 활성화 (기본: DISPLAY 환경변수 자동 감지)",
+        "--display", action="store_true", default=False,
+        help="화면 출력 활성화 (기본: 비활성, nv3dsink)",
     )
     return parser.parse_args()
 

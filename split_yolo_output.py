@@ -6,15 +6,27 @@ YOLO ONNX 최종 Concat 제거: output0 [B,84,N] → output_boxes [B,4,N] + outp
 Concat 이전 단계에서 분리하므로 INT8 스케일이 각 텐서에 독립 적용됨.
 
 사용:
-  python3 split_yolo_output.py yolov8m_512.onnx yolov8m_512_split.onnx
+  python3 split_yolo_output.py yolov8m_512.onnx
+  python3 split_yolo_output.py yolov8m_640_b100_calib.onnx   →  yolov8m_640_b100_calib_split.onnx
 """
 
-import sys
+import argparse
 import onnx
 from onnx import helper, TensorProto
 
-src = sys.argv[1] if len(sys.argv) > 1 else "yolov8m_512.onnx"
-dst = sys.argv[2] if len(sys.argv) > 2 else src.replace(".onnx", "_split.onnx")
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="YOLO ONNX 최종 Concat 제거: output0 → output_boxes + output_classes"
+    )
+    parser.add_argument("src", metavar="INPUT_ONNX",
+                        help="입력 ONNX 파일")
+    return parser.parse_args()
+
+
+args = parse_args()
+src = args.src
+dst = src.replace(".onnx", "_split.onnx")
 
 model = onnx.load(src)
 graph = model.graph
