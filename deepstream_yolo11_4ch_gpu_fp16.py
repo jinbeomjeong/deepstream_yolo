@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """
-DeepStream 4채널 YOLO11m 추론 파이프라인 (GPU CUDA, INT8)
+DeepStream 4채널 YOLO11m 추론 파이프라인 (GPU CUDA, FP16)
 
 실행:
   source /home/nvidia/workspace/arround_view/venv/bin/activate
-  python deepstream_yolo11_4ch_gpu_int8.py [video_path]          # 헤드리스 (콘솔 출력)
-  DISPLAY=:0 python deepstream_yolo11_4ch_gpu_int8.py [video_path]  # 화면 출력
+  python deepstream_yolo11_4ch_gpu_fp16.py [video1] ... [video4]                  # 헤드리스
+  DISPLAY=:0 python deepstream_yolo11_4ch_gpu_fp16.py [video1] ...                # 화면 출력
+  python deepstream_yolo11_4ch_gpu_fp16.py [video1] ... --output out.mp4          # 영상 저장
+  DISPLAY=:0 python deepstream_yolo11_4ch_gpu_fp16.py [video1] ... -o out.mp4     # 화면 + 저장
+
+  - 인자 없음: 기본 샘플 영상 4채널
+  - 1~4개 인자: 채널 순서대로 각 영상 할당
+  - --output FILE (-o FILE): 후처리 완료 영상을 HW(nvv4l2h264enc) 인코딩으로 저장
 
 파이프라인:
-  4x source → nvstreammux → nvinfer(GPU INT8) → [probe: YOLO 파싱] → OSD → tiler → sink
+  4x source → nvstreammux → nvinfer(GPU FP16) → [probe: YOLO 파싱] → tiler → OSD → sink
+                                                                                  ↘ (--output) HW encoder → mp4
 """
 
 import sys
 import os
+import argparse
 import ctypes
 import time
+import signal
 import numpy as np
 import gi
 
@@ -23,12 +32,19 @@ from gi.repository import GObject, Gst, GLib
 import pyds
 
 # ── 설정 ────────────────────────────────────────────────────────────────────────
-VIDEO_SOURCE  = (
-    sys.argv[1] if len(sys.argv) > 1
-    else "/opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4"
-)
+_parser = argparse.ArgumentParser(description="DeepStream 4채널 YOLO11m FP16 파이프라인")
+_parser.add_argument("sources", nargs="*", metavar="VIDEO",
+                     help="입력 영상 경로 (최대 4개, 생략 시 기본 샘플)")
+_parser.add_argument("--output", "-o", metavar="FILE", default=None,
+                     help="HW 인코딩으로 저장할 출력 영상 경로 (.mp4)")
+_parsed = _parser.parse_args()
+
+_DEFAULT_SRC  = "/opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4"
+VIDEO_SOURCES = _parsed.sources[:4] if _parsed.sources else [_DEFAULT_SRC] * 4
+NUM_SOURCES   = len(VIDEO_SOURCES)
+OUTPUT_PATH   = _parsed.output
+SAVE_VIDEO    = OUTPUT_PATH is not None
 PGIE_CONFIG   = "/home/nvidia/workspace/deepstream_yolo/config_infer_yolo11_gpu_fp16.txt"
-NUM_SOURCES   = 4
 MUXER_W       = 1920
 MUXER_H       = 1080
 CONF_THRESH   = 0.30
@@ -51,8 +67,9 @@ COCO_LABELS = [
 
 # ── 전역 상태 ────────────────────────────────────────────────────────────────────
 _frame_count  = 0
-_det_count    = 0
 _t_start      = time.time()
+_win_t        = time.time()   # 슬라이딩 윈도우 시작 시각
+_win_frames   = 0             # 윈도우 내 프레임 수
 _diag_printed = False   # 텐서 구조 진단 (최초 1회)
 
 
@@ -145,9 +162,9 @@ def _read_layer_arr(layer, n_elem):
 # ── 텐서 레이어 파싱 헬퍼 ────────────────────────────────────────────────────
 def _parse_layer(layer, n_frames):
     """
-    NvDsInferLayerInfo 에서 배치 텐서를 읽어 [n_frames, 84, 8400] 로 반환.
-    inferDims = [84, 8400]       → 버퍼에 n_frames × n_elem 연속 저장
-    inferDims = [n_frames,84,8400] → 버퍼에 n_elem 저장 (배치 포함)
+    NvDsInferLayerInfo 에서 배치 텐서를 읽어 [n_frames, 300, 6] 로 반환.
+    inferDims = [300, 6]         → 버퍼에 n_frames × n_elem 연속 저장
+    inferDims = [n_frames,300,6] → 버퍼에 n_elem 저장 (배치 포함)
     """
     dims  = layer.inferDims
     shape = [dims.d[j] for j in range(dims.numDims)]
@@ -218,7 +235,7 @@ def pgie_src_pad_probe(pad, info, u_data):
     if n_frames == 0:
         return Gst.PadProbeReturn.OK
 
-    tensors = [None] * n_frames   # tensors[i]: np.ndarray [84, 8400]
+    tensors = [None] * n_frames   # tensors[i]: np.ndarray [300, 6]
     diag_source = "none"
 
     # ── 2) batch_user_meta_list 우선 탐색 ────────────────────────────────────
@@ -263,7 +280,7 @@ def pgie_src_pad_probe(pad, info, u_data):
         print(f"[진단] n_frames={n_frames} | 텐서 출처={diag_source}")
         for i, fm in enumerate(frames):
             valid = tensors[i] is not None
-            conf  = float(tensors[i][4:].max()) if valid else 0.0
+            conf  = float(tensors[i][:, 4].max()) if valid else 0.0
             print(f"  [idx={i}] src={fm.source_id} batch_id={fm.batch_id} "
                   f"tensor={'유효' if valid else '없음'} max_conf={conf:.3f}")
 
@@ -271,30 +288,27 @@ def pgie_src_pad_probe(pad, info, u_data):
         return Gst.PadProbeReturn.OK
 
     # ── 5) 각 프레임에 detections 적용 ──────────────────────────────────────
-    batch_det_log = []   # 초반 배치 진단용
+    global _win_t, _win_frames
 
     for i, fm in enumerate(frames):
         if tensors[i] is None:
             continue
 
-        src_w = fm.source_frame_width  or MUXER_W
-        src_h = fm.source_frame_height or MUXER_H
-        dets  = _parse_yolo11(tensors[i], src_w, src_h)
+        dets = _parse_yolo11(tensors[i], MUXER_W, MUXER_H)
 
         _frame_count += 1
-        _det_count   += len(dets)
+        _win_frames  += 1
 
         for det in dets:
             _add_obj_meta(batch_meta, fm, det)
 
-        batch_det_log.append(f"src={fm.source_id}:{len(dets)}")
-
         if _frame_count % 100 == 0:
-            elapsed = time.time() - _t_start
-            fps = _frame_count / elapsed if elapsed > 0 else 0
-            print(f"[{_frame_count:6d}프레임] FPS={fps:.1f} | "
-                  f"총 검출={_det_count} | "
-                  f"배치 검출={' '.join(batch_det_log)}")
+            now     = time.time()
+            elapsed = now - _win_t
+            fps     = _win_frames / elapsed if elapsed > 0 else 0
+            print(f"[{_frame_count:6d}프레임] FPS={fps:.1f}")
+            _win_t      = now
+            _win_frames = 0
 
     return Gst.PadProbeReturn.OK
 
@@ -315,7 +329,7 @@ def bus_call(bus, message, loop):
 # ── 소스 생성 ─────────────────────────────────────────────────────────────────
 def make_src_and_connect(idx, path, mux, pipeline):
     udbin = Gst.ElementFactory.make("uridecodebin", f"uri-decode-{idx}")
-    udbin.set_property("uri", f"file://{path}")
+    udbin.set_property("uri", f"file://{os.path.abspath(path)}")
     pipeline.add(udbin)
 
     sink_pad = mux.request_pad_simple(f"sink_{idx}")
@@ -331,6 +345,31 @@ def make_src_and_connect(idx, path, mux, pipeline):
 
     udbin.connect("pad-added", cb_newpad, sink_pad)
 
+# ── HW 인코더 저장 브랜치 ────────────────────────────────────────────────────
+def _link_save_branch(pipeline, src_el):
+    """src_el 뒤에 nvv4l2h264enc HW 인코더 → mp4 저장 브랜치를 연결한다."""
+    conv_enc  = Gst.ElementFactory.make("nvvideoconvert", "conv-enc")
+    encoder   = Gst.ElementFactory.make("nvv4l2h264enc",  "encoder")
+    h264parse = Gst.ElementFactory.make("h264parse",      "h264-parse")
+    mux_mp4   = Gst.ElementFactory.make("mp4mux",         "mp4-mux")
+    filesink  = Gst.ElementFactory.make("filesink",       "filesink")
+
+    encoder.set_property("bitrate",       8000000)   # 8 Mbps
+    encoder.set_property("preset-level", 1)          # UltraFast (HW 최고속)
+    encoder.set_property("idrinterval",  60)          # IDR 60프레임(2초) — 표준 GOP, HW 디코더 리셋 최소화
+    filesink.set_property("location",    OUTPUT_PATH)
+    filesink.set_property("sync",        False)
+
+    for el in (conv_enc, encoder, h264parse, mux_mp4, filesink):
+        pipeline.add(el)
+
+    src_el.link(conv_enc)
+    conv_enc.link(encoder)
+    encoder.link(h264parse)
+    h264parse.link(mux_mp4)
+    mux_mp4.link(filesink)
+
+
 # ── 파이프라인 구성 ───────────────────────────────────────────────────────────
 def main():
     global pipeline
@@ -345,46 +384,74 @@ def main():
     mux.set_property("batched-push-timeout", 40000)
     pipeline.add(mux)
 
-    for i in range(NUM_SOURCES):
-        make_src_and_connect(i, VIDEO_SOURCE, mux, pipeline)
+    for i, src in enumerate(VIDEO_SOURCES):
+        make_src_and_connect(i, src, mux, pipeline)
 
-    # nvinfer (YOLO11m GPU INT8)
+    # nvinfer (YOLO11m GPU FP16)
     pgie = Gst.ElementFactory.make("nvinfer", "pgie")
     pgie.set_property("config-file-path", PGIE_CONFIG)
     pipeline.add(pgie)
 
-    if USE_DISPLAY:
-        conv_osd = Gst.ElementFactory.make("nvvideoconvert",      "conv-osd")
-        osd      = Gst.ElementFactory.make("nvdsosd",             "osd")
-        tiler    = Gst.ElementFactory.make("nvmultistreamtiler",  "tiler")
-        conv_out = Gst.ElementFactory.make("nvvideoconvert",      "conv-out")
-        sink     = Gst.ElementFactory.make("nv3dsink",            "sink")
+    mux.link(pgie)
 
-        tiler.set_property("rows",    2)
-        tiler.set_property("columns", 2)
+    if USE_DISPLAY or SAVE_VIDEO:
+        tiler    = Gst.ElementFactory.make("nvmultistreamtiler", "tiler")
+        conv_osd = Gst.ElementFactory.make("nvvideoconvert",     "conv-osd")
+        osd      = Gst.ElementFactory.make("nvdsosd",            "osd")
+        conv_out = Gst.ElementFactory.make("nvvideoconvert",     "conv-out")
+
+        tiler_cols = min(NUM_SOURCES, 2)
+        tiler_rows = (NUM_SOURCES + tiler_cols - 1) // tiler_cols
+        tiler.set_property("rows",    tiler_rows)
+        tiler.set_property("columns", tiler_cols)
         tiler.set_property("width",   1920)
         tiler.set_property("height",  1080)
         osd.set_property("process-mode", 1)
-        sink.set_property("sync", True)
 
-        for el in (tiler, conv_osd, osd, conv_out, sink):
+        for el in (tiler, conv_osd, osd, conv_out):
             pipeline.add(el)
 
-        mux.link(pgie)
         pgie.link(tiler)
         tiler.link(conv_osd)
         conv_osd.link(osd)
         osd.link(conv_out)
-        conv_out.link(sink)
-        print("출력: nv3dsink 2×2 타일 디스플레이 (Tiler -> OSD)")
+
+        if USE_DISPLAY and SAVE_VIDEO:
+            # 화면 출력 + 저장: tee로 분기
+            tee    = Gst.ElementFactory.make("tee",     "tee")
+            q_disp = Gst.ElementFactory.make("queue",   "q-disp")
+            q_save = Gst.ElementFactory.make("queue",   "q-save")
+            sink   = Gst.ElementFactory.make("nv3dsink","sink")
+            sink.set_property("sync", False)
+
+            for el in (tee, q_disp, q_save, sink):
+                pipeline.add(el)
+
+            conv_out.link(tee)
+            tee.request_pad_simple("src_%u").link(q_disp.get_static_pad("sink"))
+            q_disp.link(sink)
+            tee.request_pad_simple("src_%u").link(q_save.get_static_pad("sink"))
+            _link_save_branch(pipeline, q_save)
+            print(f"출력: nv3dsink {tiler_rows}×{tiler_cols} 타일 디스플레이 + 저장 → {OUTPUT_PATH}")
+
+        elif USE_DISPLAY:
+            sink = Gst.ElementFactory.make("nv3dsink", "sink")
+            sink.set_property("sync", False)
+            pipeline.add(sink)
+            conv_out.link(sink)
+            print(f"출력: nv3dsink {tiler_rows}×{tiler_cols} 타일 디스플레이")
+
+        else:
+            # 저장 전용: 렌더링은 하되 화면 출력 없음
+            _link_save_branch(pipeline, conv_out)
+            print(f"출력: 저장 전용 → {OUTPUT_PATH}")
+
     else:
         sink = Gst.ElementFactory.make("fakesink", "sink")
         sink.set_property("sync", False)
         pipeline.add(sink)
-
-        mux.link(pgie)
         pgie.link(sink)
-        print("출력: fakesink (헤드리스) — 화면 출력은 DISPLAY=:0 으로 실행하세요")
+        print("출력: fakesink (헤드리스) — 화면 출력은 DISPLAY=:0, 저장은 --output 사용")
 
     pgie.get_static_pad("src").add_probe(
         Gst.PadProbeType.BUFFER, pgie_src_pad_probe, 0
@@ -395,18 +462,23 @@ def main():
     bus.add_signal_watch()
     bus.connect("message", bus_call, loop)
 
-    print(f"소스: {VIDEO_SOURCE}")
-    print(f"YOLO11m GPU INT8 파이프라인 시작 ({NUM_SOURCES}채널, Ctrl+C 종료)...")
+    # SIGTERM/SIGINT → EOS 전송 → mp4mux moov 정상 기록 후 종료
+    def _graceful_stop(signum, frame):
+        print("\n종료 신호 수신 — EOS 전송 중 (파일 마무리)...")
+        pipeline.send_event(Gst.Event.new_eos())
+
+    signal.signal(signal.SIGTERM, _graceful_stop)
+    signal.signal(signal.SIGINT,  _graceful_stop)
+
+    for i, src in enumerate(VIDEO_SOURCES):
+        print(f"소스[{i}]: {src}")
+    print(f"YOLO11m GPU FP16 파이프라인 시작 ({NUM_SOURCES}채널, Ctrl+C 종료)...")
     pipeline.set_state(Gst.State.PLAYING)
-    try:
-        loop.run()
-    except KeyboardInterrupt:
-        print("\n종료합니다.")
-    finally:
-        elapsed = time.time() - _t_start
-        fps = _frame_count / elapsed if elapsed > 0 else 0
-        print(f"\n총 처리: {_frame_count}프레임 | 평균 FPS={fps:.1f} | 총 검출={_det_count}")
-        pipeline.set_state(Gst.State.NULL)
+    loop.run()
+    elapsed = time.time() - _t_start
+    fps = _frame_count / elapsed if elapsed > 0 else 0
+    print(f"\n총 처리: {_frame_count}프레임 | 평균 FPS={fps:.1f}")
+    pipeline.set_state(Gst.State.NULL)
 
 if __name__ == "__main__":
     main()
