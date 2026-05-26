@@ -1,0 +1,44 @@
+################################################################################
+# config_infer_yolo11_gpu_fp16.txt
+# YOLO11m ONNX → GPU(CUDA) FP16, batch=4
+# 커스텀 C++ 파서: pipeline/lib_parser_yolo11.so
+################################################################################
+
+[property]
+gpu-id=0
+net-scale-factor=0.00392156862745098
+model-color-format=0
+
+onnx-file=/home/nvidia/workspace/deepstream_yolo/models/yolo11m.onnx
+model-engine-file=/home/nvidia/workspace/deepstream_yolo/models/yolo11m.onnx_b4_gpu_fp16.engine
+
+# 0=FP32, 1=INT8, 2=FP16
+network-mode=2
+
+# 입력 크기 (C;H;W)
+infer-dims=3;640;640
+batch-size=4
+
+# 종횡비 유지 (letterbox) + 중앙 패딩
+maintain-aspect-ratio=1
+symmetric-padding=1
+
+# 커스텀 파서 (NMS 내장 엔진 출력 [300, 6] 처리)
+# network-type=0(Detector)이어야 parse-bbox-func-name이 호출됨 (100=Other는 호출 안 됨)
+network-type=0
+custom-lib-path=/home/nvidia/workspace/deepstream_yolo/pipeline/lib_parser_yolo11.so
+parse-bbox-func-name=NvDsInferParseYolo11
+num-detected-classes=80
+
+# 라벨 파일 — nvdsosd 자동 렌더링
+labelfile-path=/home/nvidia/workspace/deepstream_yolo/config/coco_labels.txt
+
+# cluster-mode=4: 추가 NMS/클러스터링 없음 (엔진에서 이미 처리)
+cluster-mode=4
+
+process-mode=1
+interval=0
+gie-unique-id=1
+
+[class-attrs-all]
+pre-cluster-threshold=0.30

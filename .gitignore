@@ -157,3 +157,8 @@ cython_debug/
 
 .idea/
 
+# TensorRT / ONNX 대용량 바이너리 (IDE 인덱싱 제외)
+*.onnx
+*.engine
+*.cache
+
