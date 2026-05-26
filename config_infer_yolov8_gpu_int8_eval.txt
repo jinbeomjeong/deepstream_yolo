@@ -1,16 +1,19 @@
-# config_infer_gpu_fp16_b1.txt  — GPU FP16  batch-size=1
+# config_infer_yolov8_gpu_int8_eval.txt  — GPU INT8  COCO mAP 측정용
+# pre-cluster-threshold=0.001  (Ultralytics 공식 평가 설정)
+# nms-iou-threshold=0.60
 [property]
 gpu-id=0
 net-scale-factor=0.00392156862745098
 
 onnx-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_split.onnx
-model-engine-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_b1_gpu_fp16.engine
+model-engine-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_b1_gpu_int8.engine
+int8-calib-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_gpu_int8_calib.cache
 model-color-format=0
 infer-dims=3;640;640
 
 batch-size=1
 
-network-mode=2
+network-mode=1
 
 custom-lib-path=/home/nvidia/workspace/deepstream_yolo/lib_parser_yolo.so
 parse-bbox-func-name=NvDsInferParseYolov8
@@ -29,5 +32,5 @@ interval=0
 gie-unique-id=1
 
 [class-attrs-all]
-nms-iou-threshold=0.45
-pre-cluster-threshold=0.25
+nms-iou-threshold=0.60
+pre-cluster-threshold=0.001

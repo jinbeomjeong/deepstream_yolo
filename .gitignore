@@ -159,4 +159,5 @@ cython_debug/
 
 # result files
 results/
+outputs/
 

@@ -1,0 +1,38 @@
+# config_infer_yolov8_dla0_int8_eval.txt  — DLA Core 0 INT8  COCO mAP 측정용
+# pre-cluster-threshold=0.001  (Ultralytics 공식 평가 설정)
+# nms-iou-threshold=0.60
+[property]
+gpu-id=0
+net-scale-factor=0.00392156862745098
+
+onnx-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_split.onnx
+model-engine-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_b1_dla0_int8.engine
+int8-calib-file=/home/nvidia/workspace/deepstream_yolo/yolov8m_640_dla_int8_calib.cache
+model-color-format=0
+infer-dims=3;640;640
+
+batch-size=1
+
+network-mode=1
+use-dla-core=0
+enable-dla=1
+
+custom-lib-path=/home/nvidia/workspace/deepstream_yolo/lib_parser_yolo.so
+parse-bbox-func-name=NvDsInferParseYolov8
+
+network-type=0
+num-detected-classes=80
+cluster-mode=2
+
+labelfile-path=/home/nvidia/workspace/deepstream_yolo/coco_labels.txt
+
+output-blob-names=output_boxes;output_classes
+maintain-aspect-ratio=1
+symmetric-padding=1
+process-mode=1
+interval=0
+gie-unique-id=1
+
+[class-attrs-all]
+nms-iou-threshold=0.60
+pre-cluster-threshold=0.001

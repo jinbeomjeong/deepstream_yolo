@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 """
-deepstream_yolov8_image.py
+deepstream_yolov8_video.py
 ==============================
-단일 채널 이미지 스트림 YOLOv8m 추론 (DeepStream, DLA INT8 기본)
+비디오 파일 YOLOv8m 추론 (DeepStream, DLA INT8 기본)
 
 [구조]
-  파이프라인 : appsrc(JPEG bytes 1장 = 버퍼 1개)
-                      → jpegparse → jpegdec → nvvideoconvert
-                      → capsfilter(NVMM,NV12) → nvstreammux(batch=1)
-                      → nvinfer(DLA INT8) → probe → fakesink
+  파이프라인 : filesrc → qtdemux → h264parse → nvv4l2decoder
+                      → nvvideoconvert → capsfilter(NVMM,NV12)
+                      → nvstreammux(batch=1) → nvinfer(DLA INT8) → probe → fakesink
 
-  * JPEG 파일 1개를 Gst.Buffer 1개로 밀어넣어 명확한 frame 경계 보장
   * --dla-core 0  → DLA Core 0 INT8 (기본)
   * --dla-core 1  → DLA Core 1 INT8
-  * --dla-core 2  → GPU FP16 (0·1 이외의 값)
+  * --dla-core 2  → GPU INT8 (0·1 이외의 값)
 
 실행:
-  python3 deepstream_yolov8_image.py                              # DLA Core 0 INT8 (기본)
-  python3 deepstream_yolov8_image.py --dla-core 1                 # DLA Core 1 INT8
-  python3 deepstream_yolov8_image.py --dla-core 2                 # GPU FP16
-  python3 deepstream_yolov8_image.py --image-dir /path/to/images
-  python3 deepstream_yolov8_image.py --output-dir /path/to/output # 바운딩박스 이미지 저장
-  python3 deepstream_yolov8_image.py --save-json results.json     # 추론 결과 JSON 저장
-  python3 deepstream_yolov8_image.py --power-log power.csv        # 소비 전력 CSV 저장
+  python3 deepstream_yolov8_video.py                              # DLA Core 0 INT8 (기본)
+  python3 deepstream_yolov8_video.py --dla-core 1                 # DLA Core 1 INT8
+  python3 deepstream_yolov8_video.py --dla-core 2                 # GPU INT8
+  python3 deepstream_yolov8_video.py --video /path/to/video.mp4
+  python3 deepstream_yolov8_video.py --save-json results.json     # 추론 결과 JSON 저장
+  python3 deepstream_yolov8_video.py --save-csv  results.csv      # 추론 결과 CSV 저장
+  python3 deepstream_yolov8_video.py --power-log power.csv        # 소비 전력 CSV 저장
+  python3 deepstream_yolov8_video.py --no-display                 # 화면 표시 비활성화
 """
 
 import sys
@@ -38,10 +37,9 @@ from dataclasses import dataclass, field as dc_field
 
 import gi
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst, GLib
+gi.require_version("GstPbutils", "1.0")
+from gi.repository import Gst, GLib, GstPbutils
 import pyds
-
-from PIL import Image, ImageDraw
 
 # ══════════════════════════════════════════════════════════════════════════════
 logging.basicConfig(
@@ -52,54 +50,48 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _redirect_c_fds_to_devnull() -> None:
-    """
-    C 라이브러리(NvMMLite/VIC, GStreamer)가 fd 1/fd 2 에 직접 쓰는 노이즈 로그를
-    /dev/null 로 우회한다.
 
-    원리:
-      saved_fd1 = dup(1),  saved_fd2 = dup(2)   ← 원래 터미널 fd 복사
-      dup2(/dev/null, 1),  dup2(/dev/null, 2)    ← C 코드 출력 버림
-      sys.stdout = fdopen(saved_fd1)             ← Python print/logging → 터미널
-      sys.stderr = fdopen(saved_fd2)
-
-    결과: NvMMLiteOpen, GStreamer INFO 노이즈 억제
-          Python logging(INFO/ERROR) 및 탐지 결과는 터미널에 그대로 표시
-    """
-    sys.stdout.flush()
-    sys.stderr.flush()
-
-    saved_fd1 = os.dup(1)
-    saved_fd2 = os.dup(2)
-    devnull   = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
-    os.close(devnull)
-
-    sys.stdout = os.fdopen(saved_fd1, "w", buffering=1)
-    sys.stderr = os.fdopen(saved_fd2, "w", buffering=1)
-
-    # logging 핸들러를 새 sys.stdout 으로 교체
-    for h in logging.root.handlers:
-        if isinstance(h, logging.StreamHandler):
-            h.stream = sys.stdout
-
-BASE_DIR        = "/home/nvidia/workspace/deepstream_yolo"
-PGIE_CONFIG     = f"{BASE_DIR}/config_infer_yolov8_gpu_fp16.txt"
-DLA_CONFIGS     = {
+BASE_DIR    = "/home/nvidia/workspace/deepstream_yolo"
+PGIE_CONFIG = f"{BASE_DIR}/config_infer_yolov8_gpu_int8.txt"
+DLA_CONFIGS = {
     0: f"{BASE_DIR}/config_infer_yolov8_dla0_int8.txt",
     1: f"{BASE_DIR}/config_infer_yolov8_dla1_int8.txt",
 }
 LABEL_FILE      = f"{BASE_DIR}/coco_labels.txt"
-DEFAULT_IMG_DIR = "/home/nvidia/workspace/val2017"
-
-MUX_W = 640
-MUX_H = 640
+DEFAULT_VIDEO   = f"{BASE_DIR}/video_2.mp4"
 
 FPS_LOG_INTERVAL = 5.0
 
-FRAME_RATE_N = 30
-FRAME_RATE_D = 1
+
+def _find_gpu_util_path() -> str | None:
+    """Jetson GPU 사용률 sysfs 경로 탐색. 원시값 범위: 0-1000 (permille)."""
+    import glob as _glob
+    candidates = [
+        "/sys/devices/gpu.0/load",
+        "/sys/devices/platform/gpu.0/load",
+        *_glob.glob("/sys/devices/platform/bus@0/*.gpu/load"),
+        *_glob.glob("/sys/devices/platform/*.gpu/load"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _read_gpu_util(path: str) -> float:
+    """sysfs 반환값 0-1000 (permille) → 0.0-100.0 (%)로 변환."""
+    with open(path) as f:
+        return float(f.read().strip()) / 10.0
+
+
+def _discover_video_size(video_path: str) -> tuple[int, int]:
+    """GstPbutils.Discoverer로 파이프라인 실행 전에 입력 해상도를 조회."""
+    uri = "file://" + os.path.abspath(video_path)
+    discoverer = GstPbutils.Discoverer.new(5 * Gst.SECOND)
+    info = discoverer.discover_uri(uri)
+    for stream in info.get_video_streams():
+        return stream.get_width(), stream.get_height()
+    raise RuntimeError(f"비디오 스트림 정보를 찾을 수 없음: {video_path}")
 
 
 def _load_labels(path: str) -> list:
@@ -114,43 +106,6 @@ def _make(factory: str, name: str) -> Gst.Element:
     if el is None:
         raise RuntimeError(f"GStreamer 플러그인 없음: {factory}")
     return el
-
-
-# 80 COCO 클래스용 색상 팔레트 (class_id % 20)
-_BBOX_COLORS = [
-    (255,  56,  56), (255, 157, 151), (255, 112,  31), (255, 178,  29),
-    (207, 210,  49), ( 72, 249,  10), (146, 204,  23), ( 61, 219, 134),
-    ( 26, 147,  52), (  0, 212, 187), ( 44, 153, 168), (  0, 194, 255),
-    ( 52,  69, 147), (100, 115, 255), (  0,  24, 236), (132,  56, 255),
-    ( 82,   0, 133), (203,  56, 255), (255, 149, 200), (255,  55, 199),
-]
-
-def _bbox_color(class_id: int) -> tuple:
-    return _BBOX_COLORS[class_id % len(_BBOX_COLORS)]
-
-
-def _draw_and_save(img_path: str, dets: list, output_dir: str) -> None:
-    """탐지 결과(바운딩박스 + 라벨)를 원본 이미지에 그려 output_dir 에 저장."""
-    img  = Image.open(img_path).convert("RGB")
-    iw, ih = img.size
-    # rect_params 좌표는 nvstreammux 출력(MUX_W×MUX_H) 공간 기준이므로
-    # 원본 이미지 해상도로 역변환이 필요하다.
-    sx, sy = iw / MUX_W, ih / MUX_H
-    draw = ImageDraw.Draw(img)
-    for det in dets:
-        l, t, w, h = det["bbox_ltwh"]
-        x1 = int(l * sx)
-        y1 = int(t * sy)
-        x2 = int((l + w) * sx)
-        y2 = int((t + h) * sy)
-        color = _bbox_color(det["class_id"])
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-        text = f"{det['label']} {det['confidence']:.2f}"
-        tw   = len(text) * 7
-        ty   = max(y1 - 17, 0)
-        draw.rectangle([x1, ty, x1 + tw, ty + 16], fill=color)
-        draw.text((x1 + 2, ty + 1), text, fill=(255, 255, 255))
-    img.save(os.path.join(output_dir, os.path.basename(img_path)), "JPEG", quality=92)
 
 
 # ── 전력 모니터링 (INA3221) ─────────────────────────────────────────────────
@@ -243,7 +198,6 @@ def _save_power_csv(samples: list, output_path: str, elapsed: float) -> None:
             row.append(f"{total:.1f}")
             w.writerow(row)
 
-        # 통계 요약
         w.writerow([])
         w.writerow(["# 통계", "", "min_mW", "avg_mW", "max_mW"])
         total_avg = 0.0
@@ -262,100 +216,108 @@ def _save_power_csv(samples: list, output_path: str, elapsed: float) -> None:
     logger.info("  평균 총 전력: %.1f mW  (%.3f W)", total_avg, total_avg / 1000.0)
 
 
-def _save_json_results(results: list, output_path: str, meta: dict) -> None:
-    with open(output_path, "w") as f:
-        json.dump({"meta": meta, "results": results}, f, indent=2, ensure_ascii=False)
+def _save_results_csv(results: list, output_path: str) -> None:
+    """추론 결과를 CSV로 저장. 탐지 1건 = 1행, 탐지 없는 프레임은 빈 행 1개."""
+    headers = ["frame", "num_detections", "frame_interval_ms", "fps", "gpu_util_pct",
+               "class_id", "label", "confidence",
+               "bbox_left", "bbox_top", "bbox_width", "bbox_height"]
+    with open(output_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for r in results:
+            frame    = r["frame"]
+            dets     = r["detections"]
+            n        = len(dets)
+            interval = r.get("frame_interval_ms")
+            fps_val  = f"{1000.0 / interval:.2f}" if interval else ""
+            gpu_util = r.get("gpu_util_pct", "")
+            gpu_str  = f"{gpu_util:.1f}" if isinstance(gpu_util, float) else ""
+            if dets:
+                for d in sorted(dets, key=lambda x: x["confidence"], reverse=True):
+                    l, t, bw, bh = d["bbox_ltwh"]
+                    w.writerow([frame, n, interval if interval is not None else "", fps_val,
+                                gpu_str,
+                                d["class_id"], d["label"], f"{d['confidence']:.4f}",
+                                f"{l:.1f}", f"{t:.1f}", f"{bw:.1f}", f"{bh:.1f}"])
+            else:
+                w.writerow([frame, 0, interval if interval is not None else "", fps_val,
+                            gpu_str, "", "", "", "", "", "", ""])
     total_dets = sum(len(r["detections"]) for r in results)
-    logger.info("추론 결과 저장: %s  (%d장, 탐지 %d개, 평균 %.1f개/장)",
+    logger.info("추론 결과 CSV 저장: %s  (%d프레임, 탐지 %d개, 평균 %.1f개/프레임)",
                 output_path, len(results), total_dets,
                 total_dets / max(len(results), 1))
 
 
-def _collect_images(img_dir: str, max_images: int | None = None) -> list:
-    """디렉토리에서 JPEG 파일 절대 경로 목록을 정렬하여 반환."""
-    files = sorted(
-        os.path.join(img_dir, f)
-        for f in os.listdir(img_dir)
-        if f.lower().endswith('.jpg')
-    )
-    if not files:
-        raise ValueError(f"JPEG 파일 없음: {img_dir}")
-    if max_images is not None:
-        files = files[:max_images]
-    return files
+def _save_json_results(results: list, output_path: str, meta: dict) -> None:
+    with open(output_path, "w") as f:
+        json.dump({"meta": meta, "results": results}, f, indent=2, ensure_ascii=False)
+    total_dets = sum(len(r["detections"]) for r in results)
+    logger.info("추론 결과 저장: %s  (%d프레임, 탐지 %d개, 평균 %.1f개/프레임)",
+                output_path, len(results), total_dets,
+                total_dets / max(len(results), 1))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-class StreamPipeline:
+class VideoPipeline:
     """
-    appsrc 기반 단일 파이프라인 이미지 스트림 추론.
-    JPEG 파일 1개를 Gst.Buffer 1개 단위로 밀어넣어 명확한 frame 경계를 보장.
-    push 전용 스레드가 GStreamer 스트리밍 스레드와 독립적으로 동작한다.
+    filesrc 기반 비디오 파일 추론 파이프라인.
+    filesrc → qtdemux → h264parse → nvv4l2decoder → nvvideoconvert
+            → capsfilter(NVMM,NV12) → nvstreammux → nvinfer → probe → fakesink
     """
 
-    def __init__(self, img_dir: str, config: str,
-                 max_images: int | None = None, output_dir: str | None = None,
+    def __init__(self, video_path: str, config: str,
                  display: bool = False, save_json: str | None = None,
-                 power_log: str | None = None):
-        self._config     = config
-        self._output_dir = output_dir
-        self._display    = display
-        self._save_json  = save_json
-        self._power_log  = power_log
-        self._loop       = GLib.MainLoop()
+                 save_csv: str | None = None, power_log: str | None = None,
+                 conf_threshold: float = 0.25):
+        self._video_path     = video_path
+        self._config         = config
+        self._display        = display
+        self._save_json      = save_json
+        self._save_csv       = save_csv
+        self._power_log      = power_log
+        self._conf_threshold = conf_threshold
+        self._loop           = GLib.MainLoop()
 
-        self._proc_cnt   = 0
-        self._t_start    = 0.0
-        self._t_fps_log  = 0.0
-        self._elapsed    = 0.0
-        self._avg_fps    = 0.0
-        self._probe_idx  = 0
-        self._push_thread: threading.Thread | None = None
+        self._proc_cnt           = 0
+        self._frame_cnt          = 0
+        self._t_start            = 0.0
+        self._t_fps_log          = 0.0
+        self._elapsed            = 0.0
+        self._avg_fps            = 0.0
+        self._first_frame_t      = 0.0   # 첫 프레임 probe 도달 시각 (워밍업 제외 기준점)
+        self._last_probe_t       = 0.0   # 직전 프레임 probe 시각
+        self._fps_window_frames  = 0     # 직전 FPS 로그 시점의 프레임 수
+        self._results        : list = []
+        self._power_samples  : list = []
+        self._power_active   : bool = False
+        self._gpu_util_pct   : float = 0.0   # 최근 GPU 사용률 (샘플링 스레드가 갱신)
+        self._gpu_util_path  : str | None = _find_gpu_util_path()
 
-        self._results       : list = []   # JSON 저장용
-        self._power_samples : list = []   # 전력 샘플
-        self._power_active  : bool = False
+        self._mux_w, self._mux_h = _discover_video_size(video_path)
+        logger.info("입력 해상도: %d×%d", self._mux_w, self._mux_h)
 
-        self._img_files = _collect_images(img_dir, max_images)
-        self._total     = len(self._img_files)
-
-        logger.info("이미지 목록: %d장  첫번째: %s  마지막: %s",
-                    self._total,
-                    os.path.basename(self._img_files[0]),
-                    os.path.basename(self._img_files[-1]))
-
-        self._pipeline, self._appsrc = self._build()
+        self._pipeline = self._build()
 
     # ── 파이프라인 조립 ─────────────────────────────────────────────────────
-    def _build(self) -> tuple:
+    def _build(self) -> Gst.Pipeline:
         pipeline = Gst.Pipeline()
 
-        # appsrc: push 전용 스레드(_push_loop)에서 버퍼를 밀어넣는 소스
-        # block=True → 큐가 가득 차면 push 스레드만 블로킹 (스트리밍 스레드 무관)
-        src = _make("appsrc", "src")
-        src.set_property("caps", Gst.Caps.from_string(
-            f"image/jpeg,framerate={FRAME_RATE_N}/{FRAME_RATE_D}"
-        ))
-        src.set_property("stream-type", 0)          # GST_APP_STREAM_TYPE_STREAM
-        src.set_property("format",      Gst.Format.BYTES)
-        src.set_property("is-live",     False)
-        src.set_property("block",       True)
-        src.set_property("max-bytes",   32 * 1024 * 1024)
-        # need-data 콜백 없음 — run()에서 별도 스레드가 push를 전담한다
+        src    = _make("filesrc",        "src")
+        demux  = _make("qtdemux",        "demux")
+        parse  = _make("h264parse",      "parse")
+        dec    = _make("nvv4l2decoder",  "dec")
+        nvconv = _make("nvvideoconvert", "nvconv")
 
         capsfil = _make("capsfilter", "capsfil")
         capsfil.set_property("caps", Gst.Caps.from_string(
             "video/x-raw(memory:NVMM),format=NV12"
         ))
 
-        parse  = _make("jpegparse",      "parse")
-        dec    = _make("jpegdec",         "dec")
-        nvconv = _make("nvvideoconvert",  "nvconv")
-        decode_chain = (src, parse, dec, nvconv, capsfil)
+        src.set_property("location", self._video_path)
 
         mux = _make("nvstreammux", "mux")
-        mux.set_property("width",                MUX_W)
-        mux.set_property("height",               MUX_H)
+        mux.set_property("width",                self._mux_w)
+        mux.set_property("height",               self._mux_h)
         mux.set_property("batch-size",           1)
         mux.set_property("batched-push-timeout", 100_000)
         mux.set_property("nvbuf-memory-type",    4)
@@ -365,27 +327,35 @@ class StreamPipeline:
         inf.set_property("config-file-path", self._config)
 
         if self._display:
-            nvconv2 = _make("nvvideoconvert", "nvconv2")   # NV12 → RGBA (nvdsosd GPU 모드용)
+            nvconv2 = _make("nvvideoconvert", "nvconv2")
             osd = _make("nvdsosd", "osd")
-            osd.set_property("process-mode", 1)   # GPU 모드
+            osd.set_property("process-mode", 1)
             osd.set_property("display-text", 1)
             snk = _make("nv3dsink", "snk")
-            snk.set_property("sync", False)        # DLA GPU 타이머 충돌 방지
+            snk.set_property("sync", False)
             post_inf = (nvconv2, osd, snk)
         else:
             snk = _make("fakesink", "snk")
             snk.set_property("sync", False)
             post_inf = (snk,)
 
-        for el in (*decode_chain, mux, inf, *post_inf):
+        for el in (src, demux, parse, dec, nvconv, capsfil, mux, inf, *post_inf):
             pipeline.add(el)
 
+        if not src.link(demux):
+            raise RuntimeError("filesrc → qtdemux 링크 실패")
+        demux.connect("pad-added", self._on_demux_pad_added, parse)
+
+        decode_chain = (parse, dec, nvconv, capsfil)
         for a, b in zip(decode_chain, decode_chain[1:]):
             if not a.link(b):
                 raise RuntimeError(f"{a.get_name()} → {b.get_name()} 링크 실패")
+
         capsfil.get_static_pad("src").link(mux.request_pad_simple("sink_0"))
+
         if not mux.link(inf):
             raise RuntimeError("mux → inf 링크 실패")
+
         prev = inf
         for el in post_inf:
             if not prev.link(el):
@@ -395,41 +365,54 @@ class StreamPipeline:
         inf.get_static_pad("src").add_probe(
             Gst.PadProbeType.BUFFER, self._detection_probe
         )
+        nvconv.get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._resolution_probe
+        )
 
-        return pipeline, src
+        return pipeline
 
-    # ── push 전용 스레드 ────────────────────────────────────────────────────
-    def _push_loop(self) -> None:
-        """
-        GStreamer 스트리밍 스레드와 독립된 Python 스레드에서 실행.
-        JPEG 파일 1개 = Gst.Buffer 1개 단위로 순서대로 push 한다.
-        block=True 이므로 appsrc 큐가 가득 차면 이 스레드만 대기하고
-        GStreamer 스트리밍 스레드는 계속 동작한다 (deadlock 없음).
-        """
-        frame_duration = Gst.SECOND * FRAME_RATE_D // FRAME_RATE_N
+    # ── 해상도 비교 (첫 번째 버퍼에서 한 번만 실행) ────────────────────────
+    def _resolution_probe(self, pad, info) -> Gst.PadProbeReturn:
+        caps = pad.get_current_caps()
+        if caps:
+            s = caps.get_structure(0)
+            ok_w, w = s.get_int("width")
+            ok_h, h = s.get_int("height")
+            if ok_w and ok_h:
+                logger.info(
+                    "해상도 확인  디코더: %d×%d  /  nvstreammux: %d×%d",
+                    w, h, self._mux_w, self._mux_h,
+                )
+        return Gst.PadProbeReturn.REMOVE  # 첫 프레임 이후 자동 제거
 
-        for idx, path in enumerate(self._img_files):
-            with open(path, "rb") as f:
-                data = f.read()
-
-            buf = Gst.Buffer.new_wrapped(data)
-            buf.pts      = idx * frame_duration
-            buf.dts      = idx * frame_duration
-            buf.duration = frame_duration
-
-            ret = self._appsrc.emit("push-buffer", buf)
-            if ret != Gst.FlowReturn.OK:
-                logger.error("push-buffer 실패: %s  (%s)", ret, os.path.basename(path))
-                self._loop.quit()
-                return
-
-        self._appsrc.emit("end-of-stream")
+    # ── qtdemux 동적 패드 연결 ──────────────────────────────────────────────
+    def _on_demux_pad_added(self, element: Gst.Element, pad: Gst.Pad,
+                            h264parse: Gst.Element) -> None:
+        """qtdemux가 비디오 스트림 패드를 생성할 때 h264parse sink에 연결."""
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        if caps and "video" in caps.to_string():
+            sink_pad = h264parse.get_static_pad("sink")
+            if not sink_pad.is_linked():
+                ret = pad.link(sink_pad)
+                if ret != Gst.PadLinkReturn.OK:
+                    logger.error("qtdemux → h264parse 패드 링크 실패: %s", ret)
+                else:
+                    logger.info("비디오 스트림 연결됨: %s", caps.to_string())
 
     # ── 전력 샘플링 스레드 ─────────────────────────────────────────────────
     def _power_loop(self, sensors: list) -> None:
         while self._power_active:
             self._power_samples.append(_collect_power_sample(sensors))
             time.sleep(0.5)
+
+    # ── GPU 사용률 샘플링 스레드 ────────────────────────────────────────────
+    def _gpu_util_loop(self) -> None:
+        while self._power_active:
+            try:
+                self._gpu_util_pct = _read_gpu_util(self._gpu_util_path)
+            except OSError:
+                pass
+            time.sleep(0.1)
 
     # ── 탐지 결과 probe ─────────────────────────────────────────────────────
     def _detection_probe(self, pad, info) -> Gst.PadProbeReturn:
@@ -441,6 +424,18 @@ class StreamPipeline:
         if not batch_meta:
             return Gst.PadProbeReturn.OK
 
+        batch_probe_t = time.perf_counter()
+
+        # 첫 프레임 도달 시각 기록 (워밍업 기준점)
+        if self._first_frame_t == 0.0:
+            self._first_frame_t = batch_probe_t
+
+        # 프레임 간격: 직전 probe 시각이 있을 때만 계산 (첫 프레임 제외)
+        if self._last_probe_t > 0.0:
+            frame_interval_ms = round((batch_probe_t - self._last_probe_t) * 1000.0, 2)
+        else:
+            frame_interval_ms = None
+
         fl = batch_meta.frame_meta_list
         while fl:
             try:
@@ -448,11 +443,8 @@ class StreamPipeline:
             except StopIteration:
                 break
 
-            # push 순서 = probe 순서이므로 probe_idx 로 파일명 복원
-            idx      = self._probe_idx
-            img_name = (os.path.basename(self._img_files[idx])
-                        if idx < self._total else f"frame_{idx}")
-            self._probe_idx += 1
+            frame_num = self._frame_cnt
+            self._frame_cnt += 1
 
             dets = []
             ol = fm.obj_meta_list
@@ -463,10 +455,14 @@ class StreamPipeline:
                     label = (LABELS[om.class_id]
                              if 0 <= om.class_id < len(LABELS)
                              else str(om.class_id))
+                    conf = float(om.confidence)
+                    if conf < self._conf_threshold:
+                        ol = ol.next
+                        continue
                     dets.append({
                         "class_id":   int(om.class_id),
                         "label":      label,
-                        "confidence": round(float(om.confidence), 4),
+                        "confidence": round(conf, 4),
                         "bbox_ltwh":  [round(float(r.left),  1), round(float(r.top),    1),
                                        round(float(r.width), 1), round(float(r.height), 1)],
                     })
@@ -484,14 +480,15 @@ class StreamPipeline:
                     break
 
             self._proc_cnt += 1
-            _print_results(img_name, dets)
-            if self._save_json and idx < self._total:
+
+            if self._save_json or self._save_csv:
                 self._results.append({
-                    "image_file": img_name,
-                    "detections": dets,
+                    "frame":            frame_num,
+                    "frame_interval_ms": frame_interval_ms,
+                    "gpu_util_pct":     self._gpu_util_pct,
+                    "detections":       dets,
                 })
-            if self._output_dir and idx < self._total:
-                _draw_and_save(self._img_files[idx], dets, self._output_dir)
+
             self._log_fps()
 
             try:
@@ -499,15 +496,18 @@ class StreamPipeline:
             except StopIteration:
                 break
 
+        self._last_probe_t = batch_probe_t
         return Gst.PadProbeReturn.OK
 
     def _log_fps(self) -> None:
         now = time.perf_counter()
         if now - self._t_fps_log >= FPS_LOG_INTERVAL:
-            elapsed = now - self._t_start
-            logger.info("처리량: %d / %d장  %.1fs  %.2f FPS",
-                        self._proc_cnt, self._total, elapsed,
-                        self._proc_cnt / elapsed if elapsed > 0 else 0)
+            window_frames  = self._proc_cnt - self._fps_window_frames
+            window_elapsed = now - self._t_fps_log
+            window_fps     = window_frames / window_elapsed if window_elapsed > 0 else 0
+            logger.info("처리량: %d프레임  구간 %.2f FPS  (%.1fs / %d프레임)",
+                        self._proc_cnt, window_fps, window_elapsed, window_frames)
+            self._fps_window_frames = self._proc_cnt
             self._t_fps_log = now
 
     # ── 버스 콜백 ───────────────────────────────────────────────────────────
@@ -515,9 +515,14 @@ class StreamPipeline:
         t = msg.type
         if t == Gst.MessageType.EOS:
             self._elapsed = time.perf_counter() - self._t_start
-            self._avg_fps = self._proc_cnt / self._elapsed if self._elapsed > 0 else 0
-            logger.info("EOS — %d장 / %.1fs / 평균 %.2f FPS",
-                        self._proc_cnt, self._elapsed, self._avg_fps)
+            # 첫 프레임~마지막 프레임 간격 기반 FPS (워밍업 제외)
+            frame_span = self._last_probe_t - self._first_frame_t
+            if frame_span > 0 and self._proc_cnt > 1:
+                self._avg_fps = (self._proc_cnt - 1) / frame_span
+            else:
+                self._avg_fps = 0.0
+            logger.info("EOS — %d프레임 / 평균 %.2f FPS  (프레임 간격 기준, 워밍업 제외)",
+                        self._proc_cnt, self._avg_fps)
             self._loop.quit()
         elif t == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
@@ -534,8 +539,8 @@ class StreamPipeline:
         bus.add_signal_watch()
         bus.connect("message", self._bus_call)
 
-        # 전력 모니터링 시작
-        _power_thread = None
+        _power_thread    = None
+        _gpu_util_thread = None
         if self._power_log:
             sensors = _discover_power_sensors()
             if sensors:
@@ -550,14 +555,19 @@ class StreamPipeline:
             else:
                 logger.warning("INA3221 전력 모니터 미발견 — power-log 비활성")
 
+        if self._save_csv and self._gpu_util_path:
+            self._power_active = True
+            _gpu_util_thread = threading.Thread(
+                target=self._gpu_util_loop, daemon=True, name="gpu-util"
+            )
+            _gpu_util_thread.start()
+            logger.info("GPU 사용률 모니터링 시작: %s", self._gpu_util_path)
+        elif self._save_csv:
+            logger.warning("GPU 사용률 sysfs 경로 미발견 — gpu_util_pct 미측정")
+
         ret = self._pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("파이프라인 PLAYING 전환 실패")
-
-        self._push_thread = threading.Thread(
-            target=self._push_loop, daemon=True, name="jpeg-push"
-        )
-        self._push_thread.start()
 
         self._t_start = self._t_fps_log = time.perf_counter()
 
@@ -569,70 +579,57 @@ class StreamPipeline:
             self._power_active = False
             if _power_thread and _power_thread.is_alive():
                 _power_thread.join(timeout=2.0)
+            if _gpu_util_thread and _gpu_util_thread.is_alive():
+                _gpu_util_thread.join(timeout=1.0)
             self._pipeline.set_state(Gst.State.NULL)
-            if self._push_thread and self._push_thread.is_alive():
-                self._push_thread.join(timeout=2.0)
 
         # ── 결과 저장 ──────────────────────────────────────────────────────
         if self._save_json and self._results:
             _save_json_results(self._results, self._save_json, {
+                "video":       self._video_path,
                 "config":      self._config,
-                "total_images": self._proc_cnt,
+                "total_frames": self._proc_cnt,
                 "elapsed_s":   round(self._elapsed, 3),
                 "avg_fps":     round(self._avg_fps, 2),
-                "mux_width":   MUX_W,
-                "mux_height":  MUX_H,
-                "bbox_format": "left, top, width, height (mux 640×640 좌표계)",
+                "mux_width":   self._mux_w,
+                "mux_height":  self._mux_h,
+                "bbox_format": f"left, top, width, height (mux {self._mux_w}×{self._mux_h} 좌표계)",
             })
+
+        if self._save_csv and self._results:
+            _save_results_csv(self._results, self._save_csv)
 
         if self._power_log and self._power_samples:
             _save_power_csv(self._power_samples, self._power_log, self._elapsed)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-def _print_results(img_name: str, dets: list) -> None:
-    if dets:
-        top = max(dets, key=lambda d: d["confidence"])
-        l, t, w, h = top["bbox_ltwh"]
-        suffix = f"  (+{len(dets)-1})" if len(dets) > 1 else ""
-        print(f"{img_name:15s}  탐지={len(dets):3d}  "
-              f"{top['label']:15s} {top['confidence']:.3f}"
-              f"  [{l:.0f},{t:.0f},{w:.0f}×{h:.0f}]{suffix}")
-    else:
-        print(f"{img_name:15s}  탐지=  0")
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="단일 채널 이미지 스트림 YOLOv8m 추론 (기본: DLA INT8)"
+        description="비디오 파일 YOLOv8m 추론 (기본: DLA Core 0 INT8)"
     )
-    p.add_argument("--image-dir", default=DEFAULT_IMG_DIR,
-                   help=f"이미지 디렉토리 (기본: {DEFAULT_IMG_DIR})")
-    p.add_argument("--config",    default=None,
+    p.add_argument("--video",      default=DEFAULT_VIDEO, metavar="PATH",
+                   help=f"입력 비디오 파일 (기본: {DEFAULT_VIDEO})")
+    p.add_argument("--config",     default=None,
                    help="nvinfer 설정 파일 직접 지정 (옵션)")
-    p.add_argument("--dla-core",  type=int, default=0,
-                   help="가속기 선택: 0=DLA Core 0 (기본), 1=DLA Core 1, 그 외=GPU FP16")
-    p.add_argument("--debug",     action="store_true", help="GStreamer 디버그 로그")
-    p.add_argument("--max-images", type=int, default=None,
-                   help="테스트용 최대 처리 이미지 수")
-    p.add_argument("--output-dir", default=None,
-                   help="바운딩박스·라벨을 그린 결과 이미지 저장 디렉토리 (미지정 시 저장 안 함)")
-    p.add_argument("--display", action="store_true",
-                   help="추론 결과를 실시간 화면에 표시 (DISPLAY=:0 필요, nvdsosd + nv3dsink)")
-    p.add_argument("--save-json", default=None, metavar="PATH",
+    p.add_argument("--dla-core",   type=int, default=0,
+                   help="가속기 선택: 0=DLA Core 0 (기본), 1=DLA Core 1, 그 외=GPU INT8")
+    p.add_argument("--no-display", action="store_true",
+                   help="화면 표시 비활성화 (기본: 표시 ON)")
+    p.add_argument("--save-json",  default=None, metavar="PATH",
                    help="추론 결과를 JSON으로 저장 (미지정 시 저장 안 함)")
-    p.add_argument("--power-log", default=None, metavar="PATH",
+    p.add_argument("--save-csv",   default=None, metavar="PATH",
+                   help="추론 결과를 CSV로 저장, 탐지 1건=1행 (미지정 시 저장 안 함)")
+    p.add_argument("--power-log",  default=None, metavar="PATH",
                    help="추론 중 소비 전력을 CSV로 저장 (미지정 시 측정 안 함)")
-    p.add_argument("--quiet", action="store_true",
-                   help="NvMMLite/VIC C 라이브러리 stdout 노이즈 억제")
+    p.add_argument("--conf-threshold", type=float, default=0.6, metavar="CONF",
+                   help="출력 confidence 임계값 (기본: 0.25)")
+    p.add_argument("--debug",      action="store_true", help="GStreamer 디버그 로그")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
-    if args.quiet:
-        _redirect_c_fds_to_devnull()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -645,38 +642,44 @@ def main() -> None:
         logger.info("DLA Core %d INT8", args.dla_core)
     else:
         config = args.config or PGIE_CONFIG
-        logger.info("GPU FP16")
+        logger.info("GPU INT8")
 
     if not os.path.isfile(config):
         logger.error("설정 파일 없음: %s", config)
         sys.exit(1)
 
-    if not os.path.isdir(args.image_dir):
-        logger.error("이미지 디렉토리 없음: %s", args.image_dir)
+    if not os.path.isfile(args.video):
+        logger.error("비디오 파일 없음: %s", args.video)
         sys.exit(1)
 
-    if args.display and not os.environ.get("DISPLAY"):
-        logger.error("--display 옵션은 DISPLAY 환경변수가 필요합니다. (예: DISPLAY=:0)")
+    display = not args.no_display
+    if display and not os.environ.get("DISPLAY"):
+        logger.error("디스플레이 출력에 DISPLAY 환경변수가 필요합니다. (예: DISPLAY=:0)\n"
+                     "비활성화하려면 --no-display 옵션을 사용하세요.")
         sys.exit(1)
 
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        logger.info("결과 저장 디렉토리: %s", args.output_dir)
-
-    logger.info("이미지 디렉토리: %s", args.image_dir)
+    logger.info("입력 비디오: %s", args.video)
     logger.info("설정: %s", config)
-    if args.display:
-        logger.info("디스플레이: ON (nvdsosd + nv3dsink, sync=False)")
+    logger.info("confidence 임계값: %.2f", args.conf_threshold)
 
+    if display:
+        logger.info("디스플레이: ON (nvdsosd + nv3dsink, sync=False)")
     if args.save_json:
-        logger.info("추론 결과 저장: %s", args.save_json)
+        logger.info("추론 결과 저장 (JSON): %s", args.save_json)
+    if args.save_csv:
+        logger.info("추론 결과 저장 (CSV): %s", args.save_csv)
     if args.power_log:
         logger.info("전력 로그 저장: %s", args.power_log)
 
-    StreamPipeline(args.image_dir, config,
-                   max_images=args.max_images, output_dir=args.output_dir,
-                   display=args.display, save_json=args.save_json,
-                   power_log=args.power_log).run()
+    VideoPipeline(
+        video_path=args.video,
+        config=config,
+        display=display,
+        save_json=args.save_json,
+        save_csv=args.save_csv,
+        power_log=args.power_log,
+        conf_threshold=args.conf_threshold,
+    ).run()
 
 
 if __name__ == "__main__":
