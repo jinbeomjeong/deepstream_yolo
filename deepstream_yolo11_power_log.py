@@ -9,14 +9,15 @@ DeepStream 4채널 YOLO11m 추론 파이프라인 + 소비 전력 측정 (tegras
   python deepstream_yolo11_power_log.py --power-interval 1.0 --power-csv out.csv
 
 측정 항목 (tegrastats):
-  VDD_GPU_SOC  — GPU + SoC 전력 (mW)
-  VDD_CPU_CV   — CPU + CV 전력 (mW)
-  VIN_SYS_5V0  — 시스템 전체 전력 (5 V 레일, mW)
-  VDDQ_VDD2_1V8AO — 메모리 전력 (mW)
+  VDDQ_VDD2_1V8AO — VDD2 1V8AO 레일 inst 전력 (mW)
+  VDD_CPU_CV      — CPU CV 레일 inst 전력 (mW)
+  VDD_GPU_SOC     — GPU SOC 레일 inst 전력 (mW)
+  VIN_SYS_5V0     — SYS 5V0 레일 inst 전력 (mW)
+  ALL             — 위 레일 inst 합산 전력 (mW)
 
 CSV 컬럼:
   timestamp, elapsed_s,
-  gpu_soc_mw, cpu_cv_mw, sys_5v0_mw, mem_mw, total_mw
+  vddq_vdd2_1v8ao_mw, vdd_cpu_cv_mw, vdd_gpu_soc_mw, vin_sys_5v0_mw, all_mw
 """
 
 import sys
@@ -34,8 +35,7 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline"))
-from ds_pipeline import probe_video_size, bus_call, make_src_and_connect
+from pipeline.ds_pipeline import probe_video_size, bus_call, make_src_and_connect
 
 try:
     import pyds
@@ -62,20 +62,29 @@ USE_DISPLAY    = _args.display
 POWER_INTERVAL = max(0.1, _args.power_interval)
 POWER_CSV      = _args.power_csv or f"power_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
+if USE_DISPLAY and not os.environ.get("DISPLAY"):
+    print("[오류] --display 사용 시 DISPLAY 환경변수가 필요합니다.")
+    print("       예: DISPLAY=:0 python3 deepstream_yolo11_power_log.py --display [옵션]")
+    sys.exit(1)
+
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 PGIE_CONFIG   = os.path.join(_PROJECT_ROOT, "config", "config_infer_yolo11_gpu_fp16.txt")
 
 # ── 전력 로거 ─────────────────────────────────────────────────────────────────
 # tegrastats 한 줄 예시:
-#   ... VDD_GPU_SOC 5208mW/5208mW VDD_CPU_CV 2805mW/2805mW ...
-# 패턴: NAME <cur>mW/<avg>mW  → cur(현재값) 사용
-_POWER_RE = re.compile(
-    r"VDD_GPU_SOC\s+(\d+)mW/\d+mW"
-    r".*?VDD_CPU_CV\s+(\d+)mW/\d+mW"
-    r".*?VIN_SYS_5V0\s+(\d+)mW/\d+mW"
-    r".*?VDDQ_VDD2_1V8AO\s+(\d+)mW/\d+mW",
-    re.DOTALL,
-)
+#   ... VDD_GPU_SOC 5608mW/5433mW ... VIN_SYS_5V0 5249mW/5151mW ...
+# 패턴: NAME <inst>mW/<avg>mW
+_POWER_RAILS = [
+    ("vddq_vdd2_1v8ao_mw", "VDDQ_VDD2_1V8AO"),
+    ("vdd_cpu_cv_mw",      "VDD_CPU_CV"),
+    ("vdd_gpu_soc_mw",     "VDD_GPU_SOC"),
+    ("vin_sys_5v0_mw",     "VIN_SYS_5V0"),
+]
+
+_POWER_RE = {
+    column: re.compile(rf"{re.escape(label)}\s+(\d+)mW/\d+mW")
+    for column, label in _POWER_RAILS
+}
 
 class PowerLogger:
     """
@@ -86,7 +95,8 @@ class PowerLogger:
 
     CSV_HEADER = [
         "timestamp", "elapsed_s",
-        "gpu_soc_mw", "cpu_cv_mw", "sys_5v0_mw", "mem_mw", "total_mw",
+        "vddq_vdd2_1v8ao_mw", "vdd_cpu_cv_mw",
+        "vdd_gpu_soc_mw", "vin_sys_5v0_mw", "all_mw",
     ]
 
     def __init__(self, interval_sec: float, csv_path: str):
@@ -125,19 +135,25 @@ class PowerLogger:
             for line in self._proc.stdout:
                 if self._stop.is_set():
                     break
-                m = _POWER_RE.search(line)
-                if not m:
+                values = {}
+                for column, pattern in _POWER_RE.items():
+                    m = pattern.search(line)
+                    if not m:
+                        break
+                    values[column] = int(m.group(1))
+                if len(values) != len(_POWER_RAILS):
                     continue
-                gpu_soc = int(m.group(1))
-                cpu_cv  = int(m.group(2))
-                sys_5v0 = int(m.group(3))
-                mem     = int(m.group(4))
-                total   = gpu_soc + cpu_cv + mem  # 5V 레일은 중복 포함이므로 합산 제외
+
+                all_mw = sum(values.values())
                 elapsed = round(time.time() - self._t0, 3)
                 writer.writerow([
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
                     elapsed,
-                    gpu_soc, cpu_cv, sys_5v0, mem, total,
+                    values["vddq_vdd2_1v8ao_mw"],
+                    values["vdd_cpu_cv_mw"],
+                    values["vdd_gpu_soc_mw"],
+                    values["vin_sys_5v0_mw"],
+                    all_mw,
                 ])
                 f.flush()
 
