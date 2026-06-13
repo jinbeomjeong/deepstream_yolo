@@ -64,7 +64,7 @@ def parse_args():
 
 # ── 캘리브레이션 ONNX 자동 탐색 ──────────────────────────────────────────────────
 def find_calib_onnx(model, input_size):
-    pattern = f"{model}_{input_size}_b*_calib_split.onnx"
+    pattern = f"{model}_{input_size}_b*_calib.onnx"
     matches = glob.glob(pattern)
     if not matches:
         raise RuntimeError(
@@ -77,7 +77,7 @@ def find_calib_onnx(model, input_size):
             "파일을 정리하거나 하나만 남겨 주세요"
         )
     path = matches[0]
-    m = re.search(r"_b(\d+)_calib_split\.onnx$", path)
+    m = re.search(r"_b(\d+)_calib\.onnx$", path)
     if not m:
         raise RuntimeError(f"파일명에서 배치 크기를 파싱할 수 없음: {path}")
     return path, int(m.group(1))
@@ -244,7 +244,7 @@ def main():
 
     calib_onnx, calib_batch_size = find_calib_onnx(model, input_size)
 
-    onnx_path      = f"{model}_{input_size}_split.onnx"
+    onnx_path      = f"{model}_{input_size}.onnx"
     calib_cache    = f"{model}_{input_size}_int8_calib.cache"
     engine_path    = f"{model}_{input_size}_b{BATCH_SIZE}_dla{dla_core}_int8.engine"
     timing_cache   = f"{model}_{input_size}_dla{dla_core}_timing.cache"
