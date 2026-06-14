@@ -30,6 +30,7 @@ import pickle
 import tempfile
 import argparse
 import subprocess
+import time
 import numpy as np
 import cv2
 import tensorrt as trt
@@ -293,7 +294,28 @@ def generate_dla_calib_cache(image_paths, calib_onnx_path, calib_cache,
         ]
         print(f"[DLA 캘리브레이션] DLA Core {dla_core} 컨텍스트 서브프로세스 실행...")
         print(f"  DLA 직렬화 segfault 발생 시 캐시는 이미 저장되어 있으므로 정상")
-        proc = subprocess.run(cmd, timeout=300)   # 5분 이내 완료 기대, 초과 시 강제 종료
+        proc = subprocess.Popen(cmd)
+        deadline = time.time() + 3600  # 1시간 제한
+        exit_code = None
+        while True:
+            ret = proc.poll()
+            if ret is not None:
+                exit_code = ret
+                break
+            # 캐시 파일이 생성되면 직렬화 완료를 기다릴 필요 없이 종료
+            if os.path.exists(calib_cache) and os.path.getsize(calib_cache) > 0:
+                print(f"  캐시 파일 감지 → 서브프로세스 종료")
+                proc.kill()
+                proc.wait()
+                exit_code = 0
+                break
+            if time.time() > deadline:
+                print(f"  경고: DLA 캘리브레이션 서브프로세스 타임아웃 (3600초 초과)")
+                proc.kill()
+                proc.wait()
+                exit_code = -1
+                break
+            time.sleep(3)
 
         if os.path.exists(calib_cache):
             patch_calib_cache_for_trtexec(calib_cache)
@@ -301,7 +323,7 @@ def generate_dla_calib_cache(image_paths, calib_onnx_path, calib_cache,
             print(f"  DLA 캘리브레이션 캐시 생성 완료: {calib_cache}  ({size_kb:.1f} KB)")
             return True
         else:
-            print(f"  경고: DLA 캘리브레이션 캐시 생성 실패 (exit={proc.returncode})")
+            print(f"  경고: DLA 캘리브레이션 캐시 생성 실패 (exit={exit_code})")
             print(f"  GPU 캐시를 DLA 캐시로 복사하여 계속 진행합니다.")
             return False
     finally:
@@ -387,7 +409,7 @@ class _CacheReader(trt.IInt8EntropyCalibrator2):
 
 
 # ── GPU INT8 엔진 빌드 ────────────────────────────────────────────────────────
-def build_engine_gpu(engine_path, onnx_path, calib_cache, input_size):
+def build_engine_gpu(engine_path, onnx_path, calib_cache, input_size, batch_size):
     logger  = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
     network = builder.create_network(
@@ -531,7 +553,7 @@ def main():
             print(f"ONNX  : {onnx_path}")
             print(f"엔진  : {gpu_engine_path}")
             print(f"캐시  : {gpu_calib_cache}\n")
-            build_engine_gpu(gpu_engine_path, onnx_path, gpu_calib_cache, input_size)
+            build_engine_gpu(gpu_engine_path, onnx_path, gpu_calib_cache, input_size, batch_size)
 
         print(f"\n완료:")
         print(f"  GPU 캐시: {gpu_calib_cache}")

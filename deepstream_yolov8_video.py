@@ -11,12 +11,12 @@ deepstream_yolov8_video.py
 
   * --dla-core 0  → DLA Core 0 INT8 (기본)
   * --dla-core 1  → DLA Core 1 INT8
-  * --dla-core 2  → GPU INT8 (0·1 이외의 값)
+  * --dla-core -1 → GPU INT8 (0·1 이외의 모든 값)
 
 실행:
   python3 deepstream_yolov8_video.py                              # DLA Core 0 INT8 (기본)
   python3 deepstream_yolov8_video.py --dla-core 1                 # DLA Core 1 INT8
-  python3 deepstream_yolov8_video.py --dla-core 2                 # GPU INT8
+  python3 deepstream_yolov8_video.py --dla-core -1                # GPU INT8 (0·1 이외 모든 값)
   python3 deepstream_yolov8_video.py --video /path/to/video.mp4
   python3 deepstream_yolov8_video.py --save-json results.json     # 추론 결과 JSON 저장
   python3 deepstream_yolov8_video.py --save-csv  results.csv      # 추론 결과 CSV 저장
@@ -58,9 +58,10 @@ DLA_CONFIGS = {
     1: f"{BASE_DIR}/config_infer_yolov8_dla1_int8.txt",
 }
 LABEL_FILE      = f"{BASE_DIR}/coco_labels.txt"
-DEFAULT_VIDEO   = f"{BASE_DIR}/video_2.mp4"
+DEFAULT_VIDEO   = f"{BASE_DIR}/video_h264.mp4"
 
 FPS_LOG_INTERVAL = 5.0
+METRIC_INTERVAL  = 1.0   # measure_video.py 파싱용 FPS 출력 주기 (초)
 
 
 def _find_gpu_util_path() -> str | None:
@@ -154,7 +155,11 @@ def _discover_power_sensors() -> list:
             if not (os.path.exists(vp) and os.path.exists(cp)):
                 continue
             lp = os.path.join(hwmon_dir, f"in{ch}_label")
-            rail = open(lp).read().strip() if os.path.exists(lp) else f"{dev_name}_CH{ch}"
+            if os.path.exists(lp):
+                with open(lp) as f:
+                    rail = f.read().strip()
+            else:
+                rail = f"{dev_name}_CH{ch}"
             sensor.channels.append(_PwrChannel(name=rail, volt_path=vp, curr_path=cp))
         if sensor.channels:
             sensors.append(sensor)
@@ -287,6 +292,8 @@ class VideoPipeline:
         self._first_frame_t      = 0.0   # 첫 프레임 probe 도달 시각 (워밍업 제외 기준점)
         self._last_probe_t       = 0.0   # 직전 프레임 probe 시각
         self._fps_window_frames  = 0     # 직전 FPS 로그 시점의 프레임 수
+        self._metric_t           = 0.0   # FPS 메트릭 마지막 출력 시각
+        self._metric_frames      = 0     # 메트릭 구간 프레임 수
         self._results        : list = []
         self._power_samples  : list = []
         self._power_active   : bool = False
@@ -329,7 +336,7 @@ class VideoPipeline:
         if self._display:
             nvconv2 = _make("nvvideoconvert", "nvconv2")
             osd = _make("nvdsosd", "osd")
-            osd.set_property("process-mode", 1)
+            osd.set_property("process-mode", 0)
             osd.set_property("display-text", 1)
             snk = _make("nv3dsink", "snk")
             snk.set_property("sync", False)
@@ -479,7 +486,9 @@ class VideoPipeline:
                 except StopIteration:
                     break
 
-            self._proc_cnt += 1
+            self._proc_cnt      += 1
+            self._metric_frames += 1
+            self._emit_fps_metric()
 
             if self._save_json or self._save_csv:
                 self._results.append({
@@ -498,6 +507,20 @@ class VideoPipeline:
 
         self._last_probe_t = batch_probe_t
         return Gst.PadProbeReturn.OK
+
+    def _emit_fps_metric(self) -> None:
+        """pad probe 기반 FPS를 1초 간격으로 stdout 출력 (measure_video.py 파싱용)."""
+        now = time.perf_counter()
+        if self._metric_t == 0.0:
+            self._metric_t = now
+            return
+        elapsed_win = now - self._metric_t
+        if elapsed_win < METRIC_INTERVAL:
+            return
+        fps = self._metric_frames / elapsed_win if elapsed_win > 0 else 0.0
+        print(f"[FPS] {now - self._t_start:.3f} {fps:.2f}", flush=True)
+        self._metric_t      = now
+        self._metric_frames = 0
 
     def _log_fps(self) -> None:
         now = time.perf_counter()
@@ -565,11 +588,11 @@ class VideoPipeline:
         elif self._save_csv:
             logger.warning("GPU 사용률 sysfs 경로 미발견 — gpu_util_pct 미측정")
 
+        self._t_start = self._t_fps_log = time.perf_counter()
+
         ret = self._pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("파이프라인 PLAYING 전환 실패")
-
-        self._t_start = self._t_fps_log = time.perf_counter()
 
         try:
             self._loop.run()
@@ -613,7 +636,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config",     default=None,
                    help="nvinfer 설정 파일 직접 지정 (옵션)")
     p.add_argument("--dla-core",   type=int, default=0,
-                   help="가속기 선택: 0=DLA Core 0 (기본), 1=DLA Core 1, 그 외=GPU INT8")
+                   help="가속기 선택: 0=DLA Core 0 (기본), 1=DLA Core 1, -1=GPU INT8 (0·1 이외 모든 값)")
     p.add_argument("--no-display", action="store_true",
                    help="화면 표시 비활성화 (기본: 표시 ON)")
     p.add_argument("--save-json",  default=None, metavar="PATH",
@@ -623,7 +646,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--power-log",  default=None, metavar="PATH",
                    help="추론 중 소비 전력을 CSV로 저장 (미지정 시 측정 안 함)")
     p.add_argument("--conf-threshold", type=float, default=0.6, metavar="CONF",
-                   help="출력 confidence 임계값 (기본: 0.25)")
+                   help="출력 confidence 임계값 (기본: 0.6)")
     p.add_argument("--debug",      action="store_true", help="GStreamer 디버그 로그")
     return p.parse_args()
 
