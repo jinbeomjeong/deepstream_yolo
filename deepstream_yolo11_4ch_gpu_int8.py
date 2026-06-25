@@ -1,37 +1,44 @@
 #!/usr/bin/env python3
-"""
-DeepStream 4채널 YOLO11m INT8 추론 파이프라인
-
-추론 흐름:
-  nvinfer (INT8 엔진)
-    → lib_parser_yolo.so NvDsInferParseYolo11  [84,8400] 텐서 파싱
-    → DeepStream NMS (cluster-mode=2)
-    → NvDsObjectMeta  (좌표 역변환·obj_label·text_params를 nvinfer가 자동 설정)
-    → nvdsosd         (클래스명 텍스트·바운딩박스 렌더링, probe 불필요)
-
-실행:
-  python3 deepstream_yolo11_4ch_gpu_int8.py [video_path]
-  DISPLAY=:0 python3 deepstream_yolo11_4ch_gpu_int8.py [video_path]
-"""
 
 import sys
 import os
+import argparse
 import gi
 
 gi.require_version("Gst", "1.0")
 from gi.repository import GObject, Gst, GLib
 import pyds
 
+# ── 인자 파싱 ──────────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(description="DeepStream 4채널 YOLO11m INT8 추론")
+    p.add_argument(
+        "video", nargs="?",
+        default="/opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4",
+        help="입력 영상 경로",
+    )
+    p.add_argument(
+        "--sink", choices=("auto", "display", "fakesink"), default="auto",
+        help="출력 sink 선택 (auto: DISPLAY 환경변수 따름, display: 화면 출력, fakesink: 출력 없음)",
+    )
+    return p.parse_args()
+
+
+ARGS = parse_args()
+
 # ── 설정 ──────────────────────────────────────────────────────────────────────
-VIDEO_SOURCE = (
-    sys.argv[1] if len(sys.argv) > 1
-    else "/opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4"
-)
-PGIE_CONFIG = "/home/nvidia/workspace/deepstream_yolo/config_infer_yolo11_gpu_int8.txt"
+VIDEO_SOURCE = ARGS.video
+PGIE_CONFIG = "/home/nvidia/workspace/deepstream_yolo/config/config_infer_yolo11_gpu_int8.txt"
 NUM_SOURCES = 4
 MUXER_W     = 1920
 MUXER_H     = 1080
-USE_DISPLAY = bool(os.environ.get("DISPLAY"))
+# --sink display → 강제 화면 출력, --sink fakesink → 강제 fakesink, auto → DISPLAY 따름
+if ARGS.sink == "display":
+    USE_DISPLAY = True
+elif ARGS.sink == "fakesink":
+    USE_DISPLAY = False
+else:
+    USE_DISPLAY = bool(os.environ.get("DISPLAY"))
 
 
 # ── 버스 콜백 ──────────────────────────────────────────────────────────────────
