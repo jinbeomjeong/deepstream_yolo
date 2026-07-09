@@ -2,8 +2,9 @@
 """
 yolo11m.onnx → TensorRT INT8 엔진 변환
 
-INT8 캘리브레이션 데이터는 video_h264.mp4 에서 균등 추출한 프레임을 사용.
-캘리브레이션 캐시는 yolo11m_int8_calib.cache 에 저장되어 재실행 시 재사용됨.
+INT8 캘리브레이션은 MinMax 방식(IInt8MinMaxCalibrator)을 사용.
+캘리브레이션 데이터는 video_h264.mp4 에서 균등 추출한 프레임을 사용.
+캘리브레이션 캐시는 yolo11m_int8_minmax_calib.cache 에 저장되어 재실행 시 재사용됨.
 빌더 타이밍 캐시는 yolo11m_timing.cache 에 저장되어 재빌드 시 커널 선택을 재사용.
 
 사용법:
@@ -19,7 +20,7 @@ import tensorrt as trt
 # ── 설정 ────────────────────────────────────────────────────────────────────────
 ONNX_PATH     = "../yolo11m_b4.onnx"
 ENGINE_PATH   = "../yolo11m_b4_int8.engine"
-CALIB_CACHE   = "../yolo11m_int8_calib.cache"
+CALIB_CACHE   = "../yolo11m_int8_minmax_calib.cache"  # MinMax 전용(Entropy 캐시와 분리)
 TIMING_CACHE  = "../yolo11m_timing.cache"   # 빌더 커널 타이밍 캐시
 VIDEO_PATH    = "/home/nvidia/workspace/video_h264.mp4"
 
@@ -103,7 +104,11 @@ def extract_frames(video_path, n_frames):
 
 
 # ── INT8 캘리브레이터 ────────────────────────────────────────────────────────────
-class YOLOInt8Calibrator(trt.IInt8EntropyCalibrator2):
+# MinMax 캘리브레이션: 활성값의 min/max 로 스케일 결정(tail 클리핑 없음).
+# YOLO11m 분류 헤드처럼 희소·heavy-tail 분포에서 Entropy(KL) 대비 정확도 크게 우수
+# (조사: analysis/REPORT.md §8, val2017 mAP +8점). Entropy 로 되돌리려면 base class 만
+# trt.IInt8EntropyCalibrator2 로 교체.
+class YOLOInt8Calibrator(trt.IInt8MinMaxCalibrator):
     def __init__(self, frames, batch_size, cache_file):
         super().__init__()
         self.batch_size  = batch_size
